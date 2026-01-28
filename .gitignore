@@ -1,0 +1,63 @@
+# Backend (Python / Flask)
+backend/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/*.so
+backend/.Python
+backend/venv/
+backend/env/
+backend/ENV/
+backend/.venv
+
+# Backend - Flask specific
+backend/instance/
+backend/.webassets-cache
+
+# Backend - Environment variables
+backend/.env
+
+# Frontend (React / Node)
+frontend/node_modules
+frontend/.pnp
+frontend/.pnp.js
+
+# Frontend - Testing
+frontend/coverage
+
+# Frontend - Production build
+frontend/build
+
+# Shared - IDE
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+.cursorrules
+
+# Shared - OS files
+.DS_Store
+Thumbs.db
+
+# Frontend - Env variants
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# Frontend - Logs
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# Backend - Uploads
+backend/uploads/
+
+# Python compiled files
+*.pyc
+
+# Batch files
+*.bat
+
+# Shell scripts
+*.sh

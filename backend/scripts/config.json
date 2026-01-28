@@ -1,0 +1,25 @@
+{
+  "site": null,
+  "output_dir": "output",
+  "machine_templates_path": null,
+  
+  "data_fetching": {
+    "limit": 100000,
+    "sample_interval": 5
+  },
+  
+  "road_detection": {
+    "grid_size": 5.0,
+    "min_density": 3,
+    "simplify_epsilon": 5.0
+  },
+  
+  "zone_detection": {
+    "grid_size": 10.0,
+    "min_stop_count": 20
+  },
+  
+  "simulation": {
+    "sim_time": 480
+  }
+}

@@ -1,0 +1,281 @@
+import React, { useState, useEffect } from 'react';
+
+function ExportButton({ site, onExportComplete }) {
+  const [exporting, setExporting] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState('');
+  const [files, setFiles] = useState({});
+  const [polling, setPolling] = useState(false);
+
+  useEffect(() => {
+    // Check if there's an existing export in progress
+    checkStatus();
+  }, [site]);
+
+  useEffect(() => {
+    let interval = null;
+    if (polling && exporting) {
+      interval = setInterval(() => {
+        checkStatus();
+      }, 2000); // Poll every 2 seconds
+    } else if (interval) {
+      clearInterval(interval);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [polling, exporting, site]);
+
+  const checkStatus = async () => {
+    try {
+      const response = await fetch(`/api/export/status/${encodeURIComponent(site.site_name)}`);
+      if (response.ok) {
+        const data = await response.json();
+        setStatus(data.status);
+        setProgress(data.progress || 0);
+        setMessage(data.message || '');
+        setFiles(data.files || {});
+
+        if (data.status === 'completed') {
+          setExporting(false);
+          setPolling(false);
+          if (onExportComplete) {
+            onExportComplete();
+          }
+        } else if (data.status === 'error') {
+          setExporting(false);
+          setPolling(false);
+        } else if (data.status === 'processing') {
+          setExporting(true);
+          setPolling(true);
+        }
+      }
+    } catch (err) {
+      console.error('Error checking status:', err);
+    }
+  };
+
+  const handleExport = async () => {
+    try {
+      setExporting(true);
+      setStatus('processing');
+      setProgress(0);
+      setMessage('Starting export...');
+      setFiles({});
+
+      const response = await fetch('/api/export', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          site_name: site.site_name,
+          config: {
+            limit: 100000,
+            sample_interval: 5,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Export failed');
+      }
+
+      setPolling(true);
+    } catch (err) {
+      setExporting(false);
+      setStatus('error');
+      setMessage(err.message);
+      setPolling(false);
+    }
+  };
+
+  const handleDownload = async (fileType) => {
+    try {
+      const response = await fetch(
+        `/api/export/download/${encodeURIComponent(site.site_name)}/${fileType}`
+      );
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = files[fileType] || `${fileType}.json`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      alert(`Failed to download ${fileType}: ${err.message}`);
+    }
+  };
+
+  const getStatusBadgeClass = () => {
+    switch (status) {
+      case 'completed':
+        return 'bg-success';
+      case 'processing':
+        return 'bg-info';
+      case 'error':
+        return 'bg-danger';
+      default:
+        return 'bg-secondary';
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">Export Files</div>
+      <div className="card-body">
+        <div className="mb-4">
+          <div className="d-flex align-items-center mb-2">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-muted me-2">
+              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+              <circle cx="12" cy="10" r="3"></circle>
+            </svg>
+            <strong className="text-muted">Site:</strong>
+          </div>
+          <div className="ms-4">
+            <span className="fs-5 fw-semibold">{site.site_name}</span>
+            {site.site_short && (
+              <span className="text-muted ms-2">({site.site_short})</span>
+            )}
+          </div>
+        </div>
+
+        {status && (
+          <div className="mb-4 p-3 bg-light rounded">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <div className="d-flex align-items-center">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-muted me-2">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+                <span className="text-muted me-2">Status:</span>
+                <span className={`badge ${getStatusBadgeClass()} status-badge`}>
+                  {status}
+                </span>
+              </div>
+              {progress > 0 && <span className="fw-semibold">{progress}%</span>}
+            </div>
+            {message && (
+              <p className="text-muted small mb-2 mb-0">{message}</p>
+            )}
+            {status === 'processing' && (
+              <div className="progress mt-3">
+                <div
+                  className="progress-bar progress-bar-striped progress-bar-animated"
+                  role="progressbar"
+                  style={{ width: `${progress}%` }}
+                  aria-valuenow={progress}
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                >
+                  {progress}%
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {status === 'error' && (
+          <div className="alert alert-danger" role="alert">
+            <strong>Error:</strong> {message}
+          </div>
+        )}
+
+        {status === 'completed' && Object.keys(files).length > 0 && (
+          <div className="mb-4 p-3 bg-success bg-opacity-10 rounded">
+            <div className="d-flex align-items-center mb-3">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-success me-2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                <polyline points="22 4 12 14.01 9 11.01"></polyline>
+              </svg>
+              <strong className="text-success">Generated Files:</strong>
+            </div>
+            <div className="d-flex flex-wrap gap-2">
+              {files.model && (
+                <button
+                  className="btn btn-outline-primary btn-sm"
+                  onClick={() => handleDownload('model')}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-1">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  Model
+                </button>
+              )}
+              {files.des_inputs && (
+                <button
+                  className="btn btn-outline-primary btn-sm"
+                  onClick={() => handleDownload('des_inputs')}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-1">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  DES Inputs
+                </button>
+              )}
+              {files.ledger && (
+                <button
+                  className="btn btn-outline-primary btn-sm"
+                  onClick={() => handleDownload('ledger')}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-1">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  Ledger
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        <button
+          className="btn btn-primary btn-export"
+          onClick={handleExport}
+          disabled={exporting}
+        >
+          {exporting ? (
+            <>
+              <span
+                className="spinner-border spinner-border-sm me-2"
+                role="status"
+                aria-hidden="true"
+              ></span>
+              Exporting...
+            </>
+          ) : (
+            'Export Files'
+          )}
+        </button>
+
+        {status === 'completed' && (
+          <button
+            className="btn btn-secondary btn-export"
+            onClick={() => {
+              setStatus(null);
+              setProgress(0);
+              setMessage('');
+              setFiles({});
+            }}
+          >
+            Reset
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default ExportButton;
