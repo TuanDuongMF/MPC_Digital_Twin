@@ -27,10 +27,10 @@ JSON Array Index | Database Column | Description | Unit/Notes
 [6]              | pathNorthing | Y coordinate (12320.37) | float (already in meters)
 [7]              | pathElevation | Z coordinate (276.73) | float (already in meters)
 [8]              | plannedDistance | Distance (755.52) | float (already in meters)
-[9]              | expectedSpeed | Expected speed (12.2) | float (km/h)
-[10]             | actualSpeed | Actual speed (12) | float (km/h)
-[11]             | expectedDesiredSpeed | Expected desired (12) | float (km/h)
-[12]             | actualDesiredSpeed | Actual desired (11.4) | float (km/h)
+[9]              | expectedSpeed | Expected speed (12.2) | float (m/s, convert to km/h: *3.6)
+[10]             | actualSpeed | Actual speed (12) | float (m/s, convert to km/h: *3.6)
+[11]             | expectedDesiredSpeed | Expected desired (12) | float (m/s, convert to km/h: *3.6)
+[12]             | actualDesiredSpeed | Actual desired (11.4) | float (m/s, convert to km/h: *3.6)
 [13]             | leftWidth | Left width (9) | float (already in meters)
 [14]             | rightWidth | Right width (9.3) | float (already in meters)
 [15]             | pathBank | Road banking (0) | float (degrees)
@@ -540,6 +540,7 @@ def _db_record_to_tuple(record: Dict[str, Any], raw_msg: List) -> Optional[tuple
             start_time = gps_epoch + timedelta(seconds=start_time_gps) - leap_seconds
             start_time_str = start_time.isoformat()
         
+        # Speed values from GWMReader are in m/s, convert to km/h (* 3.6)
         tuple_data = (
             int(machine_id),                                       # 0: machineId
             int(segment_id),                                       # 1: segmentId
@@ -550,10 +551,10 @@ def _db_record_to_tuple(record: Dict[str, Any], raw_msg: List) -> Optional[tuple
             float(record.get("pathNorthing", 0.0)),              # 6: pathNorthing
             float(record.get("pathElevation", 0.0)),             # 7: pathElevation
             float(record.get("plannedDistance", 0.0)),            # 8: plannedDistance
-            float(record.get("expectedSpeed", 0.0)),             # 9: expectedSpeed
-            float(record.get("actualSpeed", 0.0)),                # 10: actualSpeed
-            float(record.get("expectedDesiredSpeed", 0.0)),      # 11: expectedDesiredSpeed
-            float(record.get("actualDesiredSpeed", 0.0)),        # 12: actualDesiredSpeed
+            float(record.get("expectedSpeed", 0.0)) * 3.6,       # 9: expectedSpeed (m/s -> km/h)
+            float(record.get("actualSpeed", 0.0)) * 3.6,          # 10: actualSpeed (m/s -> km/h)
+            float(record.get("expectedDesiredSpeed", 0.0)) * 3.6, # 11: expectedDesiredSpeed (m/s -> km/h)
+            float(record.get("actualDesiredSpeed", 0.0)) * 3.6,   # 12: actualDesiredSpeed (m/s -> km/h)
             float(record.get("leftWidth", 0.0)),                  # 13: leftWidth
             float(record.get("rightWidth", 0.0)),                 # 14: rightWidth
             float(record.get("pathBank", 0.0)),                   # 15: pathBank
@@ -702,18 +703,23 @@ def _json_message_to_tuple(msg: Dict[str, Any]) -> Optional[tuple]:
         ], 0.0)
         planned_distance = float(planned_distance)
         
+        # Speed values from GWMReader are in m/s, convert to km/h
         expected_speed = get_value([
             "expectedSpeed", "expected_speed", "ExpectedSpeed"
         ], 0.0)
+        expected_speed = float(expected_speed) * 3.6
         actual_speed = get_value([
             "actualSpeed", "actual_speed", "ActualSpeed"
         ], 0.0)
+        actual_speed = float(actual_speed) * 3.6
         expected_desired_speed = get_value([
             "expectedDesiredSpeed", "expected_desired_speed", "ExpectedDesiredSpeed"
         ], 0.0)
+        expected_desired_speed = float(expected_desired_speed) * 3.6
         actual_desired_speed = get_value([
             "actualDesiredSpeed", "actual_desired_speed", "ActualDesiredSpeed"
         ], 0.0)
+        actual_desired_speed = float(actual_desired_speed) * 3.6
         
         # Widths are already in meters from GWMReader JSON
         left_width = get_value([
@@ -950,8 +956,9 @@ def convert_imported_records_to_telemetry(
         path_easting = float(record.get("pathEasting", 0.0))
         path_northing = float(record.get("pathNorthing", 0.0))
         path_elevation = float(record.get("pathElevation", 0.0))
-        expected_speed = float(record.get("expectedSpeed", 0.0))
-        actual_speed = float(record.get("actualSpeed", 0.0))
+        # Speed values from GWMReader are in m/s, convert to km/h
+        expected_speed = float(record.get("expectedSpeed", 0.0)) * 3.6
+        actual_speed = float(record.get("actualSpeed", 0.0)) * 3.6
         path_bank = float(record.get("pathBank", 0.0))
         path_heading = float(record.get("pathHeading", 0.0))
         left_width = float(record.get("leftWidth", 0.0))

@@ -1844,7 +1844,43 @@ def create_des_inputs(
         }]
         dz["uid"] = uid_counter + 1
         uid_counter += 2
-    
+
+    # Create default loaders: one loader per spot in each load zone
+    loaders: List[Dict] = []
+    loader_id = 1
+
+    # Determine default loader model and name from loader specs (if available)
+    default_loader_model_id = 1 if loader_specs else None
+    default_loader_machine_name = "Default_Loader"
+    if loader_specs:
+        default_spec = loader_specs.get(str(default_loader_model_id)) or next(iter(loader_specs.values()))
+        loader_info = default_spec.get("loader", {})
+        default_loader_machine_name = (
+            loader_info.get("Model")
+            or loader_info.get("LoaderName")
+            or default_loader_machine_name
+        )
+
+    for lz in des_load_zones:
+        zone_id = lz.get("id")
+        for spot in lz.get("spots", []):
+            spot_id = spot.get("id", 1)
+            loader_entry = {
+                "id": loader_id,
+                "name": f"Loader_{zone_id}_{spot_id}",
+                "model_id": default_loader_model_id or 1,
+                "used_for": "Truck Loading",
+                "machine_name": default_loader_machine_name,
+                "initial_conditions": {
+                    "load_zone_id": zone_id,
+                    "spot_id": spot_id,
+                },
+                "fill_factor_pct": 1.0,
+                "powernode_priority": 0,
+            }
+            loaders.append(loader_entry)
+            loader_id += 1
+
     # Create routes from load zones to dump zones
     # Routes only contain main roads - zone roads are part of zones, not routes
     des_routes = []
@@ -2019,7 +2055,7 @@ def create_des_inputs(
         "charge_zones": [],
         "service_zones": [],
         "routes": des_routes,
-        "loaders": [],
+        "loaders": loaders,
         "haulers": haulers,
         "batteries": [],
         "esses": {},
