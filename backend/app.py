@@ -32,7 +32,7 @@ sys.path.insert(0, webapp_root)
 
 from backend.core.db_config import DB_CONFIG, OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH, TEMP_DIR
 from backend.core.gateway_parser_wrapper import parse_gateway_files
-from backend.core.gateway_data_converter import process_parser_output, convert_imported_records_to_telemetry
+from backend.core.gateway_data_converter import process_parser_output, convert_imported_records_to_telemetry, extract_zones_from_import
 from backend.scripts.simulation_generator import (
     get_connection,
     fetch_sites,
@@ -142,8 +142,13 @@ def process_import_and_export(
             set_import_status(site_name, "error", 0, "Failed to convert imported data")
             return
         
+        set_import_status(site_name, "processing", 20, "Extracting zones using Reader.py algorithms...")
+
+        # Extract zones using standard Reader.py algorithms (Segment classification + DBSCAN)
+        cycles, zones = extract_zones_from_import(parse_result)
+
         set_import_status(site_name, "processing", 30, "Preparing machine information...")
-        
+
         # Create machine info from telemetry data
         machines = {}
         unique_machine_ids = set(row[0] for row in telemetry_data)
@@ -154,11 +159,11 @@ def process_import_and_export(
                 "site_name": site_name,
                 "type_name": "Unknown"
             }
-        
+
         # Load machine templates
         machine_templates = load_machine_templates(MACHINE_TEMPLATES_PATH)
-        
-        # Process site with imported telemetry data
+
+        # Process site with imported telemetry data and precomputed zones
         set_import_status(site_name, "processing", 40, "Processing site data and generating simulation files...")
         result = process_site(
             cursor=None,  # No database cursor needed for imported data
@@ -176,6 +181,7 @@ def process_import_and_export(
             machine_templates=machine_templates,
             telemetry_data=telemetry_data,
             coordinates_in_meters=True,  # Import data has coordinates in meters
+            precomputed_zones=zones if zones else None,
         )
         
         if result:

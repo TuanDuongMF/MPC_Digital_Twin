@@ -9,10 +9,12 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
+import math
 from .constants import (
     HaulerState,
     LocationType,
     PAYLOAD_THRESHOLD,
+    DEFAULT_PAYLOAD_CAPACITY,
 )
 from .node_matcher import NodeMatcher, MatchedNode
 from .event_generator import EventGenerator
@@ -110,6 +112,30 @@ class GPSToEventsConverter:
         self.node_matcher = NodeMatcher(nodes, roads)
         self.event_generator = EventGenerator(self.node_matcher)
     
+    def _get_nearest_load_zone(self, x: float, y: float) -> Tuple[int, str]:
+        """
+        Return (load_zone_id, loader_name) for the load zone nearest to (x, y).
+        Uses detected_location from model load_zones. Default (1, 'Loader_1_1') if none.
+        """
+        load_zones = self.model.get("load_zones", []) if self.model else []
+        if not load_zones:
+            return 1, "Loader_1_1"
+        best_zone_id = 1
+        best_name = "Loader_1_1"
+        best_dist = float("inf")
+        for z in load_zones:
+            loc = z.get("detected_location") or z.get("settings", {}).get("detected_location")
+            if not loc:
+                continue
+            zx = loc.get("x", 0)
+            zy = loc.get("y", 0)
+            d = math.sqrt((x - zx) ** 2 + (y - zy) ** 2)
+            if d < best_dist:
+                best_dist = d
+                best_zone_id = z.get("id", 1)
+                best_name = f"Loader_{best_zone_id}_1"
+        return best_zone_id, best_name
+    
     def convert_messages(
         self,
         messages: List[Any],
@@ -155,6 +181,11 @@ class GPSToEventsConverter:
         # This prevents constant payload fluctuation due to sensor noise
         stable_payload = None
         PAYLOAD_THRESHOLD = 50
+        # For load interval (0->100): time of last message when payload was empty
+        last_empty_time = None
+        # Number of bucket cycles per load (2 = two buckets fill hauler)
+        loader_cycles_per_load = 2
+        indv_payload_tonnes = (DEFAULT_PAYLOAD_CAPACITY / 1000.0) / loader_cycles_per_load
 
         for i, msg in enumerate(messages):
             # Extract message data
@@ -170,6 +201,7 @@ class GPSToEventsConverter:
             orientation = msg_data.get("orientation", "forward")
 
             # Smooth payload: only update when crossing threshold (empty <-> loaded)
+            prev_stable_payload = stable_payload
             if stable_payload is None:
                 # Initialize: use 0 for empty, 100 for loaded
                 stable_payload = 0 if raw_payload < PAYLOAD_THRESHOLD else 100
@@ -181,6 +213,8 @@ class GPSToEventsConverter:
                     stable_payload = 0 if raw_payload < PAYLOAD_THRESHOLD else 100
 
             payload = stable_payload
+            if stable_payload < PAYLOAD_THRESHOLD:
+                last_empty_time = event_time
             
             # Match to node - find nearest node in the road network
             # Roads are created from actual trajectories, so nodes are already
@@ -297,6 +331,51 @@ class GPSToEventsConverter:
                 last_node_id = matched_node.node_id
                 last_event_time = event_time
             
+            # Detect payload transition 0 -> 100: emit HaulerLoadStart, loader cycle events, HaulerLoadEnd
+            if (
+                prev_stable_payload is not None
+                and prev_stable_payload < PAYLOAD_THRESHOLD
+                and stable_payload >= PAYLOAD_THRESHOLD
+            ):
+                load_start_time = last_empty_time if last_empty_time is not None else last_event_time
+                load_end_time = event_time
+                if load_end_time > load_start_time:
+                    load_zone_id, loader_name = self._get_nearest_load_zone(x, y)
+                    load_start_event = self.event_generator.generate_load_start_event(
+                        machine_id=machine_id,
+                        machine_name=machine_name,
+                        event_time=load_start_time,
+                        payload_percent=0,
+                    )
+                    events.append(load_start_event)
+                    interval_sec = (load_end_time - load_start_time).total_seconds()
+                    bucket_duration_sec = interval_sec / loader_cycles_per_load
+                    for b in range(loader_cycles_per_load):
+                        t_bucket_start = load_start_time + timedelta(
+                            seconds=bucket_duration_sec * b
+                        )
+                        t_bucket_end = load_start_time + timedelta(
+                            seconds=bucket_duration_sec * (b + 1)
+                        )
+                        bucket_events = self.event_generator.generate_loader_cycle_events_for_one_bucket(
+                            loader_name=loader_name,
+                            load_zone_id=load_zone_id,
+                            hauler_id=machine_id,
+                            hauler_name=machine_name,
+                            t_start=t_bucket_start,
+                            t_end=t_bucket_end,
+                            indv_payload_tonnes=indv_payload_tonnes,
+                        )
+                        events.extend(bucket_events)
+                    load_end_event = self.event_generator.generate_load_end_event(
+                        machine_id=machine_id,
+                        machine_name=machine_name,
+                        event_time=load_end_time,
+                        payload_percent=100,
+                    )
+                    events.append(load_end_event)
+            
+            last_event_time = event_time
             last_speed = speed
         
         return events

@@ -191,6 +191,16 @@ DEFAULT_NODE_STRUCT = {
 }
 
 
+# Default loader struct template (per events_structure_specification.md 3.8)
+DEFAULT_LOADER_STRUCT = {
+    "name": "",
+    "hauler_name": "",
+    "time_duration": 0.0,
+    "power": 0.0,
+    "indv_payload": 0.0,
+}
+
+
 # Event types used in conversion
 class EventType:
     """Event type names."""
@@ -205,6 +215,19 @@ class EventType:
     HAULER_DUMP_END = "HaulerDumpEnd"
     HAULER_IDLE_START = "HaulerIdleStart"
     HAULER_IDLE_END = "HaulerIdleEnd"
+    # Loader cycle events (4.9 Loader Events)
+    LOADER_IDLE_START = "LoaderIdleStart"
+    LOADER_IDLE_END = "LoaderIdleEnd"
+    LOADER_CYCLE_DIG_START = "LoaderCycleDigStart"
+    LOADER_CYCLE_DIG_END = "LoaderCycleDigEnd"
+    LOADER_CYCLE_SWING_START = "LoaderCycleSwingStart"
+    LOADER_CYCLE_SWING_END = "LoaderCycleSwingEnd"
+    LOADER_CYCLE_LOAD_START = "LoaderCycleLoadStart"
+    LOADER_CYCLE_LOAD_END = "LoaderCycleLoadEnd"
+    LOADER_CYCLE_RETURN_START = "LoaderCycleReturnStart"
+    LOADER_CYCLE_RETURN_END = "LoaderCycleReturnEnd"
+    LOADER_SHUTDOWN_START = "LoaderShutdownStart"
+    LOADER_SHUTDOWN_END = "LoaderShutdownEnd"
 
 
 # Payload threshold for empty/loaded classification (percentage)

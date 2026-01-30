@@ -891,6 +891,67 @@ def get_objects_summary(cycles: Optional[List[Cycle]], zones: Optional[List[Zone
     return summary
 
 
+def extract_zones_from_import(
+    parser_output: Dict[str, Any],
+) -> Tuple[List, List]:
+    """
+    Extract Cycles and Zones from imported data using Reader.py standard algorithms.
+
+    Uses parse_cp1_data() per machine to classify segments (Spotting, Travelling)
+    and DBSCAN clustering (createLoadDumpAreas) for zone detection.
+
+    Args:
+        parser_output: Raw parser output from GWMReader
+
+    Returns:
+        Tuple of (all_cycles, all_zones) — Cycle and Zone objects from Reader.py
+    """
+    records_by_machine, is_cp2 = extract_cp_records(parser_output)
+
+    if not records_by_machine:
+        return [], []
+
+    all_cycles = []
+    all_zones = []
+
+    for machine_key, raw_messages in records_by_machine.items():
+        if not raw_messages:
+            continue
+
+        # Build 25-element tuples for this machine
+        machine_tuples = []
+        for raw_msg in raw_messages:
+            if len(raw_msg) < 24:
+                continue
+            record = parse_message_to_dict(raw_msg)
+            t = _db_record_to_tuple(record, raw_msg)
+            if t is not None:
+                machine_tuples.append(t)
+
+        if not machine_tuples:
+            continue
+
+        # Determine machine_id from the first tuple
+        machine_id = machine_tuples[0][0]
+        machine_info = {
+            "Name": f"Machine_{machine_id}",
+            "TypeName": "Unknown",
+        }
+
+        # Sort tuples by segmentId then actualElapsedTime for correct segment grouping
+        machine_tuples.sort(key=lambda x: (x[1], x[4]))
+
+        parse_fn = AMTCycleProdInfoReader.parse_cp2_data if is_cp2 else AMTCycleProdInfoReader.parse_cp1_data
+        result = parse_fn(machine_tuples, machine_info)
+
+        if result and result[0]:
+            all_cycles.extend(result[0])
+        if result and result[1]:
+            all_zones.extend(result[1])
+
+    return all_cycles, all_zones
+
+
 def convert_imported_records_to_telemetry(
     parser_output: Dict[str, Any],
     records: List[Dict[str, Any]],

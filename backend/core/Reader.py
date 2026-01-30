@@ -37,12 +37,20 @@ class AMTCycleProdInfoReader:
         if valid_data.empty:
             return zones
 
+        has_z = "z" in data_df.columns
+
         for cluster_id, points_data in valid_data.groupby("cluster"):
             zone = Zone(zone_type=zone_type, zone_id=None)
-            zone.updatePoints(
-                list(zip(points_data["x"], points_data["y"])),
-                cycle_ids=points_data["cycleId"].tolist() if "cycleId" in points_data.columns else None,
-            )
+            if has_z:
+                zone.updatePoints(
+                    list(zip(points_data["x"], points_data["y"], points_data["z"])),
+                    cycle_ids=points_data["cycleId"].tolist() if "cycleId" in points_data.columns else None,
+                )
+            else:
+                zone.updatePoints(
+                    list(zip(points_data["x"], points_data["y"])),
+                    cycle_ids=points_data["cycleId"].tolist() if "cycleId" in points_data.columns else None,
+                )
             zone.updateProperties()
             zones.append(zone)
 
@@ -66,8 +74,8 @@ class AMTCycleProdInfoReader:
 
         cycles: List[Cycle] = []
         zones: List[Zone] = []
-        dump_zone_points: List[Tuple[float, float, int, int, str]] = []
-        load_zone_points: List[Tuple[float, float, int, int, str]] = []
+        dump_zone_points: List[Tuple[float, float, float, int, int, str]] = []
+        load_zone_points: List[Tuple[float, float, float, int, int, str]] = []
 
         # Group contiguous messages by segmentId
         segments: List[Tuple[int, List[AMTCycleProdInfoMessage], List[int]]] = []
@@ -130,7 +138,7 @@ class AMTCycleProdInfoReader:
                 if segment_obj.preferredPath:
                     dump_zone_points.extend(
                         [
-                            (point[0], point[1], cycle.cycleId, cycle.machineId, machine_name)
+                            (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                             for point in segment_obj.preferredPath
                             if point
                         ]
@@ -142,7 +150,7 @@ class AMTCycleProdInfoReader:
                 if segment_obj.preferredPath:
                     load_zone_points.extend(
                         [
-                            (point[0], point[1], cycle.cycleId, cycle.machineId, machine_name)
+                            (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                             for point in segment_obj.preferredPath
                             if point
                         ]
@@ -160,10 +168,10 @@ class AMTCycleProdInfoReader:
             cycles.append(cycle)
 
         if load_zone_points:
-            load_data_df = pd.DataFrame(load_zone_points, columns=["x", "y", "cycleId", "machineId", "machineName"])
+            load_data_df = pd.DataFrame(load_zone_points, columns=["x", "y", "z", "cycleId", "machineId", "machineName"])
             zones.extend(cls.createLoadDumpAreas(load_data_df, ZoneType.LOAD))
         if dump_zone_points:
-            dump_data_df = pd.DataFrame(dump_zone_points, columns=["x", "y", "cycleId", "machineId", "machineName"])
+            dump_data_df = pd.DataFrame(dump_zone_points, columns=["x", "y", "z", "cycleId", "machineId", "machineName"])
             zones.extend(cls.createLoadDumpAreas(dump_data_df, ZoneType.DUMP))
 
         return cycles, zones
@@ -192,8 +200,8 @@ class AMTCycleProdInfoReader:
 
         cycles: List[Cycle] = []
         zones: List[Zone] = []
-        dump_zone_points: List[Tuple[float, float, int, int, str]] = []
-        load_zone_points: List[Tuple[float, float, int, int, str]] = []
+        dump_zone_points: List[Tuple[float, float, float, int, int, str]] = []
+        load_zone_points: List[Tuple[float, float, float, int, int, str]] = []
 
         # Group contiguous messages by cycleId
         cycle_groups: List[Tuple[int, List[AMTCycleProdInfoMessage], List[int]]] = []
@@ -239,7 +247,7 @@ class AMTCycleProdInfoReader:
                     if segment.preferredPath:
                         dump_zone_points.extend(
                             [
-                                (point[0], point[1], cycle.cycleId, cycle.machineId, machine_name)
+                                (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                                 for point in segment.preferredPath[-10:]
                                 if point
                             ]
@@ -248,7 +256,7 @@ class AMTCycleProdInfoReader:
                     if segment.preferredPath:
                         load_zone_points.extend(
                             [
-                                (point[0], point[1], cycle.cycleId, cycle.machineId, machine_name)
+                                (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                                 for point in segment.preferredPath[-10:]
                                 if point
                             ]
@@ -256,10 +264,10 @@ class AMTCycleProdInfoReader:
 
         # Create zones from extracted points
         if load_zone_points:
-            load_data_df = pd.DataFrame(load_zone_points, columns=["x", "y", "cycleId", "machineId", "machineName"])
+            load_data_df = pd.DataFrame(load_zone_points, columns=["x", "y", "z", "cycleId", "machineId", "machineName"])
             zones.extend(cls.createLoadDumpAreas(load_data_df, ZoneType.LOAD))
         if dump_zone_points:
-            dump_data_df = pd.DataFrame(dump_zone_points, columns=["x", "y", "cycleId", "machineId", "machineName"])
+            dump_data_df = pd.DataFrame(dump_zone_points, columns=["x", "y", "z", "cycleId", "machineId", "machineName"])
             zones.extend(cls.createLoadDumpAreas(dump_data_df, ZoneType.DUMP))
 
         return cycles, zones

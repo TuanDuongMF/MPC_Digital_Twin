@@ -801,6 +801,132 @@ def order_path_points(points: List[Tuple]) -> List[Tuple]:
     return ordered
 
 
+def convert_reader_zones_to_model(
+    reader_zones: List,
+    nodes: List[Dict],
+    roads: List[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Convert Reader.Zone objects to model zone dicts (same format as detect_zones output).
+
+    Args:
+        reader_zones: Zone objects from Reader.py (with zoneType, centroid, points)
+        nodes: Road network nodes
+        roads: Road network roads
+
+    Returns:
+        Tuple of (load_zones, dump_zones)
+    """
+    from backend.core.constants import ZoneType
+
+    if not reader_zones:
+        return [], []
+
+    # Build node lookup for nearest road endpoint search
+    node_lookup = {n["id"]: n for n in nodes}
+    road_endpoints = []
+    for road in roads:
+        if len(road["nodes"]) >= 2:
+            start_node = node_lookup.get(road["nodes"][0])
+            end_node = node_lookup.get(road["nodes"][-1])
+            if start_node and end_node:
+                road_endpoints.append({
+                    "road_id": road["id"],
+                    "start": tuple(start_node["coords"]),
+                    "end": tuple(end_node["coords"]),
+                    "start_node_id": road["nodes"][0],
+                    "end_node_id": road["nodes"][-1],
+                })
+
+    def find_nearest_road_endpoint(x, y):
+        min_dist = float('inf')
+        nearest = None
+        for ep in road_endpoints:
+            for label in ("start", "end"):
+                node_id_key = f"{label}_node_id"
+                dx = x - ep[label][0]
+                dy = y - ep[label][1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest = {"road_id": ep["road_id"], "node_id": ep[node_id_key], "distance": dist}
+        return nearest
+
+    load_zones = []
+    dump_zones = []
+    load_id = 1
+    dump_id = 1
+
+    for zone in reader_zones:
+        # Compute centroid from zone points
+        if hasattr(zone, 'centroid') and zone.centroid:
+            cx, cy = zone.centroid[0][0], zone.centroid[0][1]
+            avg_z = zone.centroid[0][2] if len(zone.centroid[0]) > 2 else 0.0
+        elif hasattr(zone, 'points') and zone.points:
+            xs = [p[0] for p in zone.points]
+            ys = [p[1] for p in zone.points]
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            zs = [p[2] for p in zone.points if len(p) > 2]
+            avg_z = sum(zs) / len(zs) if zs else 0.0
+        else:
+            continue
+
+        nearest = find_nearest_road_endpoint(cx, cy)
+        if nearest is None or nearest["distance"] > 200:
+            continue
+
+        zone_settings = {
+            "n_spots": 1,
+            "roadlength": 100,
+            "speed_limit": "",
+            "rolling_resistance": "",
+            "flip": False,
+            "dtheta": 0,
+            "n_entrances": 1,
+            "queing": False,
+            "reverse_speed_limit": "",
+            "width": 50,
+            "angular_spread": 80,
+            "create_uturn_road": False,
+            "clearance_radius": 80,
+            "access_distance": 40,
+            "zonetype": "standard",
+            "inroad_ids": [nearest["road_id"]],
+            "outroad_ids": [nearest["road_id"]],
+            "innode_ids": [nearest["node_id"]],
+            "outnode_ids": [nearest["node_id"]],
+        }
+
+        zone_type_name = zone.zoneType.value if hasattr(zone.zoneType, 'value') else str(zone.zoneType)
+
+        if zone_type_name == "LOAD":
+            zone_dict = {
+                "id": load_id,
+                "name": f"Load zone {load_id}",
+                "keys": "load_zones",
+                "is_generated": True,
+                "connector_zone_data": [],
+                "settings": zone_settings,
+                "detected_location": {"x": cx, "y": cy, "z": avg_z},
+            }
+            load_zones.append(zone_dict)
+            load_id += 1
+        elif zone_type_name == "DUMP":
+            zone_dict = {
+                "id": dump_id,
+                "name": f"Dump zone {dump_id}",
+                "is_generated": True,
+                "connector_zone_data": [],
+                "settings": zone_settings,
+                "detected_location": {"x": cx, "y": cy, "z": avg_z},
+            }
+            dump_zones.append(zone_dict)
+            dump_id += 1
+
+    return load_zones, dump_zones
+
+
 def detect_zones(
     telemetry_data: List[Tuple],
     nodes: List[Dict],
@@ -2102,10 +2228,11 @@ def process_site(
     machine_templates: Optional[Dict[str, Any]] = None,
     telemetry_data: Optional[List[Tuple]] = None,
     coordinates_in_meters: Optional[bool] = None,
+    precomputed_zones: Optional[List] = None,
 ) -> Dict[str, str]:
     """
     Process site data and generate all output files.
-    
+
     Args:
         cursor: Database cursor (can be None if telemetry_data is provided)
         site_name: Site name
@@ -2124,6 +2251,8 @@ def process_site(
         coordinates_in_meters: If True, coordinates are in meters (import flow).
                               If False, coordinates are in millimeters (database flow).
                               If None, will be determined based on data source.
+        precomputed_zones: Optional list of Reader.Zone objects from parse_cp1_data.
+                          If provided, uses these instead of detect_zones().
 
     Returns:
         Dictionary with paths to generated files
@@ -2203,10 +2332,16 @@ def process_site(
     
     # Detect zones
     print("  [3/5] Detecting load/dump zones...")
-    load_zones, dump_zones = detect_zones(
-        telemetry_data, nodes, roads, zone_grid_size, zone_min_stops,
-        coordinates_in_meters=coordinates_in_meters
-    )
+    if precomputed_zones is not None:
+        print("    Using precomputed zones from Reader.py (Segment classification + DBSCAN)...")
+        load_zones, dump_zones = convert_reader_zones_to_model(
+            precomputed_zones, nodes, roads
+        )
+    else:
+        load_zones, dump_zones = detect_zones(
+            telemetry_data, nodes, roads, zone_grid_size, zone_min_stops,
+            coordinates_in_meters=coordinates_in_meters
+        )
     print(f"    Found {len(load_zones)} load zones, {len(dump_zones)} dump zones")
     
     # Create model

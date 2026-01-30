@@ -55,12 +55,19 @@ class Zone:
                 points_list.append(self.points)
 
             for points in points_list:
-                x, y = list(map(list, zip(*points)))
-                self.centroid.append((np.mean(x), np.mean(y)))
-                if len(set(points)) > 2:
-                    self.area.append(MultiPoint(points).convex_hull)
-                elif len(set(points)) >= 1:
-                    self.area.append(MultiPoint(points).buffer(5))
+                coords = list(map(list, zip(*points)))
+                x, y = coords[0], coords[1]
+                if len(coords) > 2:
+                    z = coords[2]
+                    self.centroid.append((np.mean(x), np.mean(y), np.mean(z)))
+                else:
+                    self.centroid.append((np.mean(x), np.mean(y)))
+                # Use only (x, y) for 2D geometry operations
+                xy_points = list(zip(x, y))
+                if len(set(xy_points)) > 2:
+                    self.area.append(MultiPoint(xy_points).convex_hull)
+                elif len(set(xy_points)) >= 1:
+                    self.area.append(MultiPoint(xy_points).buffer(5))
 
     def isZoneInArea(self, x_min, x_max, y_min, y_max):
         """This function checks whether zone is present in particular area.

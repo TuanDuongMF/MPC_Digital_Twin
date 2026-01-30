@@ -18,6 +18,7 @@ from .constants import (
     EventType,
     DEFAULT_HAULER_STRUCT,
     DEFAULT_NODE_STRUCT,
+    DEFAULT_LOADER_STRUCT,
     PAYLOAD_THRESHOLD,
     DEFAULT_PAYLOAD_CAPACITY,
 )
@@ -453,6 +454,82 @@ class EventGenerator:
         )
         
         return event
+    
+    def _create_loader_struct(
+        self,
+        loader_name: str,
+        hauler_name: str = "",
+        time_duration: float = 0.0,
+        power: float = 0.0,
+        indv_payload: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Create loader struct per events_structure_specification.md 3.8."""
+        loader = copy.deepcopy(DEFAULT_LOADER_STRUCT)
+        loader["name"] = loader_name
+        loader["hauler_name"] = hauler_name
+        loader["time_duration"] = time_duration
+        loader["power"] = power
+        loader["indv_payload"] = indv_payload
+        return loader
+    
+    def generate_loader_cycle_events_for_one_bucket(
+        self,
+        loader_name: str,
+        load_zone_id: int,
+        hauler_id: int,
+        hauler_name: str,
+        t_start: datetime,
+        t_end: datetime,
+        indv_payload_tonnes: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate 8 loader cycle events for one bucket (Dig -> Swing -> Load -> Return).
+        Times are evenly distributed in [t_start, t_end].
+        """
+        if t_end <= t_start:
+            return []
+        total_sec = (t_end - t_start).total_seconds()
+        step_sec = total_sec / 8.0
+        events_out = []
+        cycle_duration_min = total_sec / 60.0
+        bucket_duration_min = cycle_duration_min / 8.0
+        
+        cycle_etypes = [
+            EventType.LOADER_CYCLE_DIG_START,
+            EventType.LOADER_CYCLE_DIG_END,
+            EventType.LOADER_CYCLE_SWING_START,
+            EventType.LOADER_CYCLE_SWING_END,
+            EventType.LOADER_CYCLE_LOAD_START,
+            EventType.LOADER_CYCLE_LOAD_END,
+            EventType.LOADER_CYCLE_RETURN_START,
+            EventType.LOADER_CYCLE_RETURN_END,
+        ]
+        for i in range(8):
+            t = t_start + timedelta(seconds=step_sec * i)
+            loader_struct = self._create_loader_struct(
+                loader_name=loader_name,
+                hauler_name=hauler_name,
+                time_duration=bucket_duration_min,
+                power=0.0,
+                indv_payload=indv_payload_tonnes,
+            )
+            ev = self._create_base_event(cycle_etypes[i], t)
+            ev["loader"] = loader_struct
+            ev["ess"] = None
+            if i % 2 == 1:
+                # End events: include hauler struct
+                ev["hauler"] = self._create_hauler_struct(
+                    hauler_id,
+                    hauler_name,
+                    speed=0.0,
+                    payload=0.0,
+                    hauler_state=HaulerState.LOADING,
+                    location=LocationType.LOAD,
+                    location_id=load_zone_id,
+                )
+            events_out.append(ev)
+        
+        return events_out
     
     def generate_load_start_event(
         self,

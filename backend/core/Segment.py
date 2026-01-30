@@ -298,7 +298,7 @@ class Segment:
         :type messages: list
         """
         left_edge_points, right_edge_points, preferred_path_points = \
-            list(map(list, zip(*[(msg.leftEdge, msg.rightEdge, (msg.pathEasting, msg.pathNorthing))
+            list(map(list, zip(*[(msg.leftEdge, msg.rightEdge, (msg.pathEasting, msg.pathNorthing, msg.pathElevation))
                                  for msg in messages])))
         # self.path = Polygon(left_edge_points.extend(right_edge_points[::-1]))
         left_edge_points.extend(right_edge_points[::-1])
