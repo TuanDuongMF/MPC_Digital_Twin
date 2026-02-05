@@ -53,6 +53,7 @@ from .Reader import AMTCycleProdInfoReader
 from .Cycle import Cycle
 from .Zone import Zone
 from .constants import gps_epoch, leap_seconds
+from tqdm import tqdm
 
 
 # Helper functions from parse_gateway_messages.py
@@ -160,13 +161,19 @@ def process_parser_output(parser_output: Dict[str, Any]) -> List[Dict[str, Any]]
 
     all_records = []
 
-    for ip_address, messages in records_by_ip.items():
-        for msg in messages:
-            if len(msg) < 24:
-                continue
+    # Count total messages for progress bar
+    total_messages = sum(len(messages) for messages in records_by_ip.values())
+    print(f"\n[Parser Output] Processing {total_messages:,} messages...")
 
-            record = parse_message_to_dict(msg)
-            all_records.append(record)
+    with tqdm(total=total_messages, desc="Processing messages", unit="msg") as pbar:
+        for ip_address, messages in records_by_ip.items():
+            for msg in messages:
+                pbar.update(1)
+                if len(msg) < 24:
+                    continue
+
+                record = parse_message_to_dict(msg)
+                all_records.append(record)
 
     return all_records
 
@@ -998,8 +1005,9 @@ def convert_imported_records_to_telemetry(
     
     # Convert to telemetry tuples
     telemetry_tuples = []
+    print(f"\n[Converter] Converting {len(records):,} records to telemetry format...")
 
-    for i, record in enumerate(records):
+    for i, record in enumerate(tqdm(records, desc="Converting records", unit="rec")):
         raw_msg = raw_messages[i] if i < len(raw_messages) else {"machineId": 0, "segmentId": 0}
         
         machine_id = raw_msg.get("machineId", 0)

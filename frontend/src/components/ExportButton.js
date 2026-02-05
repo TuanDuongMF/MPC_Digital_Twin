@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 function ExportButton({ site, onExportComplete }) {
   const [exporting, setExporting] = useState(false);
@@ -6,28 +6,24 @@ function ExportButton({ site, onExportComplete }) {
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
   const [files, setFiles] = useState({});
-  const [polling, setPolling] = useState(false);
+  const eventSourceRef = useRef(null);
 
   useEffect(() => {
-    // Check if there's an existing export in progress
-    checkStatus();
+    // Check if there's an existing export in progress on mount
+    checkInitialStatus();
   }, [site]);
 
   useEffect(() => {
-    let interval = null;
-    if (polling && exporting) {
-      interval = setInterval(() => {
-        checkStatus();
-      }, 2000); // Poll every 2 seconds
-    } else if (interval) {
-      clearInterval(interval);
-    }
+    // Cleanup SSE on unmount
     return () => {
-      if (interval) clearInterval(interval);
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
     };
-  }, [polling, exporting, site]);
+  }, []);
 
-  const checkStatus = async () => {
+  const checkInitialStatus = async () => {
     try {
       const response = await fetch(`/api/export/status/${encodeURIComponent(site.site_name)}`);
       if (response.ok) {
@@ -37,23 +33,55 @@ function ExportButton({ site, onExportComplete }) {
         setMessage(data.message || '');
         setFiles(data.files || {});
 
-        if (data.status === 'completed') {
-          setExporting(false);
-          setPolling(false);
-          if (onExportComplete) {
-            onExportComplete();
-          }
-        } else if (data.status === 'error') {
-          setExporting(false);
-          setPolling(false);
-        } else if (data.status === 'processing') {
+        if (data.status === 'processing') {
           setExporting(true);
-          setPolling(true);
+          startSSE();
         }
       }
     } catch (err) {
       console.error('Error checking status:', err);
     }
+  };
+
+  const startSSE = () => {
+    // Close existing connection if any
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const eventSource = new EventSource(`/api/export/events/${encodeURIComponent(site.site_name)}`);
+    eventSourceRef.current = eventSource;
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setStatus(data.status);
+        setProgress(data.progress || 0);
+        setMessage(data.message || '');
+        setFiles(data.files || {});
+
+        if (data.status === 'completed') {
+          setExporting(false);
+          eventSource.close();
+          eventSourceRef.current = null;
+          if (onExportComplete) {
+            onExportComplete();
+          }
+        } else if (data.status === 'error') {
+          setExporting(false);
+          eventSource.close();
+          eventSourceRef.current = null;
+        }
+      } catch (err) {
+        console.error('Error parsing SSE data:', err);
+      }
+    };
+
+    eventSource.onerror = () => {
+      // SSE connection closed or error
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
   };
 
   const handleExport = async () => {
@@ -83,12 +111,12 @@ function ExportButton({ site, onExportComplete }) {
         throw new Error(error.error || 'Export failed');
       }
 
-      setPolling(true);
+      // Start SSE for real-time status updates
+      startSSE();
     } catch (err) {
       setExporting(false);
       setStatus('error');
       setMessage(err.message);
-      setPolling(false);
     }
   };
 
@@ -268,6 +296,10 @@ function ExportButton({ site, onExportComplete }) {
               setProgress(0);
               setMessage('');
               setFiles({});
+              if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+                eventSourceRef.current = null;
+              }
             }}
           >
             Reset

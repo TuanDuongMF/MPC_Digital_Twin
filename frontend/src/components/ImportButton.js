@@ -8,8 +8,8 @@ function ImportButton({ site, onImportComplete }) {
   const [exportStatus, setExportStatus] = useState(null);
   const [exportFiles, setExportFiles] = useState(null);
   const fileInputRef = useRef(null);
-  const statusPollIntervalRef = useRef(null);
-  
+  const eventSourceRef = useRef(null);
+
   const DEFAULT_SITE_NAME = 'DefaultSite';
 
   const handleFileSelect = (event) => {
@@ -21,41 +21,51 @@ function ImportButton({ site, onImportComplete }) {
   };
 
   useEffect(() => {
-    // Cleanup polling on unmount
+    // Cleanup SSE on unmount
     return () => {
-      if (statusPollIntervalRef.current) {
-        clearInterval(statusPollIntervalRef.current);
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
       }
     };
   }, []);
 
-  const pollImportStatus = async () => {
-    try {
-      const response = await fetch(`/api/import/status/${encodeURIComponent(DEFAULT_SITE_NAME)}`);
-      if (response.ok) {
-        const data = await response.json();
+  const startSSE = () => {
+    // Close existing connection if any
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const eventSource = new EventSource(`/api/import/events/${encodeURIComponent(DEFAULT_SITE_NAME)}`);
+    eventSourceRef.current = eventSource;
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
         setExportStatus(data.status);
         setMessage(data.message || '');
-        
+
         if (data.status === 'completed') {
           setStatus('completed');
           setExportFiles(data.files || {});
-          if (statusPollIntervalRef.current) {
-            clearInterval(statusPollIntervalRef.current);
-            statusPollIntervalRef.current = null;
-          }
+          eventSource.close();
+          eventSourceRef.current = null;
         } else if (data.status === 'error') {
           setStatus('error');
           setError(data.message || 'Export failed');
-          if (statusPollIntervalRef.current) {
-            clearInterval(statusPollIntervalRef.current);
-            statusPollIntervalRef.current = null;
-          }
+          eventSource.close();
+          eventSourceRef.current = null;
         }
+      } catch (err) {
+        console.error('Error parsing SSE data:', err);
       }
-    } catch (err) {
-      console.error('Error polling import status:', err);
-    }
+    };
+
+    eventSource.onerror = () => {
+      // SSE connection closed or error - this is normal when server closes after completion
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
   };
 
   const handleDownloadFile = async (fileType, filename) => {
@@ -126,16 +136,8 @@ function ImportButton({ site, onImportComplete }) {
           setStatus('processing');
           setMessage('Import completed. Exporting simulation files...');
 
-          // Start polling for export status
-          if (statusPollIntervalRef.current) {
-            clearInterval(statusPollIntervalRef.current);
-          }
-          statusPollIntervalRef.current = setInterval(() => {
-            pollImportStatus();
-          }, 2000);
-
-          // Initial poll
-          pollImportStatus();
+          // Start SSE for real-time status updates
+          startSSE();
           setImporting(false);
         } else {
           let serverMessage = `Server error: ${xhr.status}`;
@@ -355,9 +357,9 @@ function ImportButton({ site, onImportComplete }) {
               setError(null);
               setExportStatus(null);
               setExportFiles(null);
-              if (statusPollIntervalRef.current) {
-                clearInterval(statusPollIntervalRef.current);
-                statusPollIntervalRef.current = null;
+              if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+                eventSourceRef.current = null;
               }
               if (fileInputRef.current) {
                 fileInputRef.current.value = '';

@@ -554,8 +554,12 @@ def create_roads_from_trajectories(
     # Create roads from each machine's trajectory
     roads = []
     road_id = 1
-    
-    for machine_id, trajectory in machine_trajectories.items():
+
+    machine_iter = machine_trajectories.items()
+    if TQDM_AVAILABLE:
+        machine_iter = tqdm(list(machine_iter), desc="    Building roads", unit="machine")
+
+    for machine_id, trajectory in machine_iter:
         if len(trajectory) < 2:
             continue
         
@@ -606,6 +610,18 @@ def create_roads_from_trajectories(
             road_id += 1
     
     print(f"    Created {len(all_nodes)} nodes and {len(roads)} roads from trajectories")
+
+    # Cleanup: Remove unused nodes (nodes not referenced by any road)
+    used_node_ids = set()
+    for road in roads:
+        used_node_ids.update(road["nodes"])
+
+    original_node_count = len(all_nodes)
+    all_nodes = [node for node in all_nodes if node["id"] in used_node_ids]
+
+    if len(all_nodes) < original_node_count:
+        print(f"    Cleaned up {original_node_count - len(all_nodes)} unused nodes")
+
     return all_nodes, roads
 
 
@@ -752,6 +768,18 @@ def detect_road_network(
             road_id += 1
     
     print(f"    Created {len(all_nodes):,} nodes and {len(roads):,} roads")
+
+    # Cleanup: Remove unused nodes (nodes not referenced by any road)
+    used_node_ids = set()
+    for road in roads:
+        used_node_ids.update(road["nodes"])
+
+    original_node_count = len(all_nodes)
+    all_nodes = [node for node in all_nodes if node["id"] in used_node_ids]
+
+    if len(all_nodes) < original_node_count:
+        print(f"    Cleaned up {original_node_count - len(all_nodes)} unused nodes")
+
     return all_nodes, roads
 
 
@@ -2440,16 +2468,18 @@ def process_site(
     with open(ledger_path, "w", encoding="utf-8") as f:
         json.dump(events_output, f, indent=2, default=str)
     
-    print(f"\n  Output files saved to: {output_dir}")
-    print(f"    - Model: model_{safe_name}.json ({len(nodes)} nodes, {len(roads)} roads)")
-    print(f"    - DES Inputs: des_inputs_{safe_name}.json ({len(des_inputs['haulers'])} haulers)")
-    print(f"    - Events Ledger: simulation_ledger_{safe_name}.json ({len(all_events)} events)")
-    
-    return {
+    print(f"\n  Output files saved to: {output_dir}", flush=True)
+    print(f"    - Model: model_{safe_name}.json ({len(nodes)} nodes, {len(roads)} roads)", flush=True)
+    print(f"    - DES Inputs: des_inputs_{safe_name}.json ({len(des_inputs['haulers'])} haulers)", flush=True)
+    print(f"    - Events Ledger: simulation_ledger_{safe_name}.json ({len(all_events)} events)", flush=True)
+
+    result = {
         "model": model_path,
         "des_inputs": des_inputs_path,
         "ledger": ledger_path,
     }
+    print(f"\n  [process_site] Returning result: {list(result.keys())}", flush=True)
+    return result
 
 
 def main():

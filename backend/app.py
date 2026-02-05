@@ -16,10 +16,12 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Any
-from flask import Flask, jsonify, request, send_file
+from queue import Queue
+from flask import Flask, jsonify, request, send_file, Response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
@@ -79,6 +81,9 @@ export_status = {}
 # Store import status (for import + export flow)
 import_status = {}
 
+# SSE event queues for real-time updates (site_name -> list of queues)
+sse_subscribers: Dict[str, List[Queue]] = {}
+
 
 def get_export_status(site_name: str) -> dict:
     """Get export status for a site."""
@@ -91,13 +96,16 @@ def get_export_status(site_name: str) -> dict:
 
 
 def set_export_status(site_name: str, status: str, progress: int = 0, message: str = "", files: dict = None):
-    """Set export status for a site."""
-    export_status[site_name] = {
+    """Set export status for a site and notify SSE subscribers."""
+    data = {
         "status": status,
         "progress": progress,
         "message": message,
         "files": files or {}
     }
+    export_status[site_name] = data
+    # Notify SSE subscribers
+    _notify_sse(site_name, "export", data)
 
 
 def get_import_status(site_name: str) -> dict:
@@ -111,13 +119,37 @@ def get_import_status(site_name: str) -> dict:
 
 
 def set_import_status(site_name: str, status: str, progress: int = 0, message: str = "", files: dict = None):
-    """Set import+export status for a site."""
-    import_status[site_name] = {
+    """Set import+export status for a site and notify SSE subscribers."""
+    data = {
         "status": status,
         "progress": progress,
         "message": message,
         "files": files or {}
     }
+    import_status[site_name] = data
+    # Notify SSE subscribers
+    _notify_sse(site_name, "import", data)
+
+
+def _notify_sse(site_name: str, event_type: str, data: dict):
+    """Push event to all SSE subscribers for a site."""
+    key = f"{event_type}:{site_name}"
+    print(f"[SSE] Notifying {key}, status={data.get('status')}, subscribers={len(sse_subscribers.get(key, []))}", flush=True)
+    if key in sse_subscribers:
+        event_data = json.dumps(data)
+        dead_queues = []
+        for q in sse_subscribers[key]:
+            try:
+                q.put_nowait(event_data)
+                print(f"[SSE] Event pushed to queue successfully", flush=True)
+            except Exception as e:
+                print(f"[SSE] Failed to push to queue: {e}", flush=True)
+                dead_queues.append(q)
+        # Remove dead queues
+        for q in dead_queues:
+            sse_subscribers[key].remove(q)
+    else:
+        print(f"[SSE] No subscribers for {key}", flush=True)
 
 
 def process_import_and_export(
@@ -165,6 +197,7 @@ def process_import_and_export(
 
         # Process site with imported telemetry data and precomputed zones
         set_import_status(site_name, "processing", 40, "Processing site data and generating simulation files...")
+        print(f"\n[Import] Starting process_site for {site_name}...", flush=True)
         result = process_site(
             cursor=None,  # No database cursor needed for imported data
             site_name=site_name,
@@ -183,14 +216,16 @@ def process_import_and_export(
             coordinates_in_meters=True,  # Import data has coordinates in meters
             precomputed_zones=zones if zones else None,
         )
-        
+
+        print(f"\n[Import] process_site returned: {result is not None}", flush=True)
         if result:
             # Convert absolute paths to relative filenames
             files = {}
             for key, path in result.items():
                 if os.path.exists(path):
                     files[key] = os.path.basename(path)
-            
+
+            print(f"[Import] Setting status to completed with files: {files}", flush=True)
             set_import_status(
                 site_name,
                 "completed",
@@ -198,10 +233,15 @@ def process_import_and_export(
                 "Import and export completed successfully",
                 files
             )
+            print(f"[Import] Status set to completed successfully!", flush=True)
         else:
+            print(f"[Import] process_site returned None or empty result", flush=True)
             set_import_status(site_name, "error", 0, "Failed to generate files")
-            
+
     except Exception as e:
+        import traceback
+        print(f"[Import] Exception occurred: {str(e)}", flush=True)
+        traceback.print_exc()
         set_import_status(site_name, "error", 0, f"Error: {str(e)}")
 
 
@@ -362,6 +402,38 @@ def get_export_status_endpoint(site_name: str):
     return jsonify(status), 200
 
 
+@app.route('/api/export/events/<site_name>', methods=['GET'])
+def export_events_sse(site_name: str):
+    """SSE endpoint for real-time export status updates."""
+    def event_stream():
+        q = Queue()
+        key = f"export:{site_name}"
+        if key not in sse_subscribers:
+            sse_subscribers[key] = []
+        sse_subscribers[key].append(q)
+
+        # Send current status immediately
+        current = get_export_status(site_name)
+        yield f"data: {json.dumps(current)}\n\n"
+
+        try:
+            while True:
+                # Timeout 600s (10 minutes) for long-running exports
+                data = q.get(timeout=600)
+                yield f"data: {data}\n\n"
+                # Stop if completed or error
+                parsed = json.loads(data)
+                if parsed.get("status") in ("completed", "error"):
+                    break
+        except Exception:
+            pass
+        finally:
+            if key in sse_subscribers and q in sse_subscribers[key]:
+                sse_subscribers[key].remove(q)
+
+    return Response(event_stream(), mimetype='text/event-stream')
+
+
 @app.route('/api/export/download/<site_name>/<file_type>', methods=['GET'])
 def download_file(site_name: str, file_type: str):
     """Download exported file."""
@@ -448,6 +520,8 @@ def import_files():
         # Create temporary directory for uploaded files
         # Use TEMP_DIR from env or system temp to avoid Windows MAX_PATH (260) limit
         temp_base = TEMP_DIR if TEMP_DIR else None
+        if temp_base and not os.path.exists(temp_base):
+            os.makedirs(temp_base, exist_ok=True)
         temp_upload_dir = tempfile.mkdtemp(prefix='imp_', dir=temp_base)
         file_paths = []
         
@@ -473,21 +547,36 @@ def import_files():
                 # Check if it's a zip file
                 if filename.lower().endswith('.zip'):
                     # Extract zip file - use short directory name to avoid Windows MAX_PATH (260) limit
-                    extract_dir = os.path.join(temp_upload_dir, f"ext_{len(file_paths)}")
+                    extract_dir = os.path.join(temp_upload_dir, f"e{len(file_paths)}")
                     os.makedirs(extract_dir, exist_ok=True)
-                    
+
                     try:
                         with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                            # Extract all files
-                            zip_ref.extractall(extract_dir)
-                            
-                            # Find all extracted files (recursively)
-                            for root, dirs, files_in_dir in os.walk(extract_dir):
-                                for file_in_dir in files_in_dir:
-                                    extracted_file = os.path.join(root, file_in_dir)
-                                    # Only add non-zip files (avoid nested zips)
-                                    if not file_in_dir.lower().endswith('.zip'):
-                                        file_paths.append(extracted_file)
+                            # Count valid files for progress bar
+                            valid_files = [
+                                zi for zi in zip_ref.infolist()
+                                if not zi.is_dir() and not zi.filename.lower().endswith('.zip')
+                            ]
+                            total_files = len(valid_files)
+                            print(f"\n[ZIP] Extracting {total_files} files from {filename}")
+
+                            # Extract files one by one with short names to avoid MAX_PATH limit
+                            file_idx = 0
+                            for zip_info in tqdm(valid_files, desc="Extracting", unit="file"):
+                                # Get original extension
+                                orig_name = os.path.basename(zip_info.filename)
+                                _, ext = os.path.splitext(orig_name)
+
+                                # Create short filename: f0.dat, f1.dat, etc.
+                                short_name = f"f{file_idx}{ext}"
+                                target_path = os.path.join(extract_dir, short_name)
+
+                                # Extract file content and write to short path
+                                with zip_ref.open(zip_info) as src, open(target_path, 'wb') as dst:
+                                    shutil.copyfileobj(src, dst)
+
+                                file_paths.append(target_path)
+                                file_idx += 1
                     except zipfile.BadZipFile:
                         return jsonify({"error": f"Invalid zip file: {filename}"}), 400
                 else:
@@ -497,10 +586,12 @@ def import_files():
                 return jsonify({"error": "No valid files found"}), 400
             
             # Parse files using gateway parser
+            # Pass temp_base to avoid Windows MAX_PATH (260) limit
             parse_result = parse_gateway_files(
                 site_name=site_name,
                 file_paths=file_paths,
-                parser_exe_path=EXECUTE_FILE_PATH
+                parser_exe_path=EXECUTE_FILE_PATH,
+                temp_base_dir=temp_base
             )
             
             # Check if parsing was successful
@@ -565,6 +656,38 @@ def get_import_status_endpoint(site_name: str):
     """Get import+export status for a site."""
     status = get_import_status(site_name)
     return jsonify(status), 200
+
+
+@app.route('/api/import/events/<site_name>', methods=['GET'])
+def import_events_sse(site_name: str):
+    """SSE endpoint for real-time import status updates."""
+    def event_stream():
+        q = Queue()
+        key = f"import:{site_name}"
+        if key not in sse_subscribers:
+            sse_subscribers[key] = []
+        sse_subscribers[key].append(q)
+
+        # Send current status immediately
+        current = get_import_status(site_name)
+        yield f"data: {json.dumps(current)}\n\n"
+
+        try:
+            while True:
+                # Timeout 600s (10 minutes) for long-running imports
+                data = q.get(timeout=600)
+                yield f"data: {data}\n\n"
+                # Stop if completed or error
+                parsed = json.loads(data)
+                if parsed.get("status") in ("completed", "error"):
+                    break
+        except Exception:
+            pass
+        finally:
+            if key in sse_subscribers and q in sse_subscribers[key]:
+                sse_subscribers[key].remove(q)
+
+    return Response(event_stream(), mimetype='text/event-stream')
 
 
 @app.route('/api/import/download/<site_name>/<file_type>', methods=['GET'])

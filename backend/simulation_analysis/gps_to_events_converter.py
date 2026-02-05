@@ -18,6 +18,7 @@ from .constants import (
 )
 from .node_matcher import NodeMatcher, MatchedNode
 from .event_generator import EventGenerator
+from .road_navigator import RoadNavigator, NavigationResult
 
 
 # GPS epoch for time conversion
@@ -102,15 +103,19 @@ class GPSToEventsConverter:
         self._initialize_from_model()
     
     def _initialize_from_model(self) -> None:
-        """Initialize NodeMatcher and EventGenerator from loaded model."""
+        """Initialize NodeMatcher, EventGenerator, and RoadNavigator from loaded model."""
         if not self.model:
             return
-        
+
         nodes = self.model.get("nodes", [])
         roads = self.model.get("roads", [])
-        
+
         self.node_matcher = NodeMatcher(nodes, roads)
         self.event_generator = EventGenerator(self.node_matcher)
+
+        # Build nodes dict for RoadNavigator
+        self._nodes_dict = {n["id"]: n for n in nodes}
+        self._roads_list = roads
     
     def _get_nearest_load_zone(self, x: float, y: float) -> Tuple[int, str]:
         """
@@ -146,6 +151,7 @@ class GPSToEventsConverter:
         include_idle_events: bool = True,
         idle_threshold_seconds: float = 30.0,
         coordinates_in_meters: bool = False,
+        use_road_constrained_navigation: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Convert AMT messages to simulation events.
@@ -160,6 +166,8 @@ class GPSToEventsConverter:
             idle_threshold_seconds: Minimum duration to consider as idle
             coordinates_in_meters: If True, coordinates are already in meters.
                                   If False, coordinates are in millimeters and will be converted.
+            use_road_constrained_navigation: If True, use RoadNavigator for sequential
+                                            node traversal along roads
 
         Returns:
             List of event dictionaries
@@ -169,6 +177,15 @@ class GPSToEventsConverter:
 
         # Store coordinates_in_meters for use in _extract_message_data
         self._coordinates_in_meters = coordinates_in_meters
+
+        # Initialize RoadNavigator if road-constrained navigation is enabled
+        road_navigator = None
+        if use_road_constrained_navigation and hasattr(self, '_nodes_dict') and hasattr(self, '_roads_list'):
+            road_navigator = RoadNavigator(
+                nodes=self._nodes_dict,
+                roads=self._roads_list,
+                max_search_distance=max_search_distance,
+            )
 
         events = []
         last_node_id = None
@@ -215,17 +232,33 @@ class GPSToEventsConverter:
             payload = stable_payload
             if stable_payload < PAYLOAD_THRESHOLD:
                 last_empty_time = event_time
-            
-            # Match to node - find nearest node in the road network
-            # Roads are created from actual trajectories, so nodes are already
-            # in correct sequence order
-            matched_node = self.node_matcher.find_nearest_node(
-                x, y, z, max_search_distance
-            )
-            
-            if matched_node is None:
-                continue
-            
+
+            # Use road-constrained navigation or fallback to simple node matching
+            if road_navigator is not None:
+                nav_result = road_navigator.navigate_to_gps(x, y, z)
+                if nav_result is None:
+                    continue
+
+                matched_node = MatchedNode(
+                    node_id=nav_result.node_id,
+                    node_name=nav_result.node_name,
+                    distance=nav_result.distance_from_gps,
+                    coords=nav_result.coords,
+                    road_id=nav_result.road_id,
+                    is_trolley=False,
+                )
+                intermediate_nodes = nav_result.intermediate_nodes
+                road_switched = nav_result.road_switched
+            else:
+                # Fallback to simple nearest node matching
+                matched_node = self.node_matcher.find_nearest_node(
+                    x, y, z, max_search_distance
+                )
+                if matched_node is None:
+                    continue
+                intermediate_nodes = []
+                road_switched = False
+
             # Generate init event for first message
             if i == 0:
                 init_event = self.event_generator.generate_hauler_init_event(
@@ -241,7 +274,7 @@ class GPSToEventsConverter:
                 last_event_time = event_time
                 last_speed = speed
                 continue
-            
+
             # Handle idle detection
             if include_idle_events:
                 if speed <= 1.0 and last_speed is not None and last_speed > 1.0:
@@ -263,7 +296,7 @@ class GPSToEventsConverter:
                                 payload_percent=payload,
                             )
                             events.append(idle_start_event)
-                            
+
                             # Generate idle end event
                             idle_end_event = self.event_generator.generate_idle_end_event(
                                 machine_id=machine_id,
@@ -273,24 +306,78 @@ class GPSToEventsConverter:
                                 payload_percent=payload,
                             )
                             events.append(idle_end_event)
-                    
+
                     is_idle = False
                     idle_start_time = None
                     idle_node = None
-            
-            # Check if we've moved to a new node
+
+            # Generate events for intermediate nodes (road-constrained navigation)
+            if intermediate_nodes and last_node_id is not None:
+                for inter_node_id in intermediate_nodes:
+                    inter_node_data = self.node_matcher.get_node_by_id(inter_node_id)
+                    if inter_node_data:
+                        inter_coords = inter_node_data.get("coords", [0, 0, 0])
+                        inter_matched_node = MatchedNode(
+                            node_id=inter_node_id,
+                            node_name=inter_node_data.get("name", f"Node_{inter_node_id}"),
+                            distance=0.0,
+                            coords=tuple(inter_coords[:3]) if len(inter_coords) >= 3 else (inter_coords[0], inter_coords[1], 0.0),
+                            road_id=matched_node.road_id,
+                            is_trolley=False,
+                        )
+
+                        # Generate leave event for previous node
+                        if last_node_id != inter_node_id:
+                            last_node_data = self.node_matcher.get_node_by_id(last_node_id)
+                            if last_node_data:
+                                last_coords = last_node_data.get("coords", [0, 0, 0])
+                                last_matched_node = MatchedNode(
+                                    node_id=last_node_id,
+                                    node_name=last_node_data.get("name", f"Node_{last_node_id}"),
+                                    distance=0.0,
+                                    coords=tuple(last_coords[:3]) if len(last_coords) >= 3 else (last_coords[0], last_coords[1], 0.0),
+                                    road_id=None,
+                                    is_trolley=False,
+                                )
+                                leave_event = self.event_generator.generate_node_leave_event(
+                                    machine_id=machine_id,
+                                    machine_name=machine_name,
+                                    event_time=event_time,
+                                    node=last_matched_node,
+                                    speed=speed,
+                                    payload_percent=payload,
+                                    segment_type=segment_type,
+                                    orientation=orientation,
+                                )
+                                events.append(leave_event)
+
+                        # Generate arrive event for intermediate node
+                        arrive_event = self.event_generator.generate_node_arrive_event(
+                            machine_id=machine_id,
+                            machine_name=machine_name,
+                            event_time=event_time,
+                            node=inter_matched_node,
+                            speed=speed,
+                            payload_percent=payload,
+                            segment_type=segment_type,
+                            orientation=orientation,
+                        )
+                        events.append(arrive_event)
+                        last_node_id = inter_node_id
+
+            # Check if we've moved to a new node (final target node)
             if matched_node.node_id != last_node_id:
                 # Check minimum distance from last node
                 if last_node_id:
                     seg_length = self.node_matcher.calculate_segment_length(
                         last_node_id, matched_node.node_id
                     )
-                    if seg_length < min_node_distance:
+                    if seg_length < min_node_distance and not intermediate_nodes:
                         # Update last_node_id even when skipping to avoid getting stuck
                         # when multiple consecutive nodes are within min_node_distance
                         last_node_id = matched_node.node_id
                         continue
-                    
+
                     # Generate node leave event for the previous node
                     last_node_data = self.node_matcher.get_node_by_id(last_node_id)
                     if last_node_data:
@@ -327,10 +414,10 @@ class GPSToEventsConverter:
                     orientation=orientation,
                 )
                 events.append(arrive_event)
-                
+
                 last_node_id = matched_node.node_id
                 last_event_time = event_time
-            
+
             # Detect payload transition 0 -> 100: emit HaulerLoadStart, loader cycle events, HaulerLoadEnd
             if (
                 prev_stable_payload is not None
@@ -374,10 +461,15 @@ class GPSToEventsConverter:
                         payload_percent=100,
                     )
                     events.append(load_end_event)
-            
+
             last_event_time = event_time
             last_speed = speed
-        
+
+        # Store road navigation history for debugging/analysis
+        if road_navigator is not None:
+            self._last_road_history = road_navigator.get_road_history()
+            self._last_visited_nodes = road_navigator.get_visited_nodes()
+
         return events
     
     def convert_cycles(
@@ -628,7 +720,17 @@ class GPSToEventsConverter:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, default=str)
     
+    def get_last_road_history(self) -> List[int]:
+        """Get road history from last conversion (for debugging/analysis)."""
+        return getattr(self, '_last_road_history', [])
+
+    def get_last_visited_nodes(self) -> List[int]:
+        """Get visited nodes from last conversion (for debugging/analysis)."""
+        return getattr(self, '_last_visited_nodes', [])
+
     def reset(self) -> None:
         """Reset converter state for new conversion."""
         if self.event_generator:
             self.event_generator.reset()
+        self._last_road_history = []
+        self._last_visited_nodes = []
