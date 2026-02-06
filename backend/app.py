@@ -7,6 +7,7 @@ Endpoints:
 - POST /api/import - Import and parse raw data files
 """
 
+import io
 import os
 import sys
 import json
@@ -41,6 +42,7 @@ from backend.scripts.simulation_generator import (
     fetch_machines,
     process_site,
     load_machine_templates,
+    load_machines_list,
     DEFAULT_CONFIG,
 )
 
@@ -73,6 +75,12 @@ MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024
 MACHINE_TEMPLATES_PATH = os.path.join(
     EXAMPLE_JSON_PATH,
     "simulation", "machine_templates.json"
+)
+
+# Machines list path (contains machine specs by model name)
+MACHINES_LIST_PATH = os.path.join(
+    EXAMPLE_JSON_PATH,
+    "machines_list.json"
 )
 
 # Store export status
@@ -157,11 +165,17 @@ def process_import_and_export(
     parse_result: Dict[str, Any],
     records: List[Dict[str, Any]],
     config: Dict[str, Any],
+    output_base_name: str = None,
+    export_model: bool = True,
+    export_simulation: bool = True,
 ):
     """Process import and export in background thread."""
+    # Use output_base_name for file naming, fallback to site_name
+    file_base_name = output_base_name if output_base_name else site_name
+
     try:
-        set_import_status(site_name, "processing", 10, "Converting imported data to telemetry format...")
-        
+        set_import_status(file_base_name, "processing", 10, "Converting imported data to telemetry format...")
+
         # Convert imported records to telemetry tuple format
         sample_interval = config.get('sample_interval', DEFAULT_CONFIG['data_fetching']['sample_interval'])
         telemetry_data = convert_imported_records_to_telemetry(
@@ -169,35 +183,75 @@ def process_import_and_export(
             records,
             sample_interval=sample_interval
         )
-        
+
         if not telemetry_data:
-            set_import_status(site_name, "error", 0, "Failed to convert imported data")
+            set_import_status(file_base_name, "error", 0, "Failed to convert imported data")
             return
-        
-        set_import_status(site_name, "processing", 20, "Extracting zones using Reader.py algorithms...")
+
+        set_import_status(file_base_name, "processing", 20, "Extracting zones using Reader.py algorithms...")
 
         # Extract zones using standard Reader.py algorithms (Segment classification + DBSCAN)
         cycles, zones = extract_zones_from_import(parse_result)
 
-        set_import_status(site_name, "processing", 30, "Preparing machine information...")
+        set_import_status(file_base_name, "processing", 30, "Preparing machine information...")
 
         # Create machine info from telemetry data
+        # Note: row[0] is IPAddress in the machines table, not Machine Unique Id
         machines = {}
-        unique_machine_ids = set(row[0] for row in telemetry_data)
-        for machine_id in unique_machine_ids:
-            machines[machine_id] = {
-                "machine_unique_id": machine_id,
-                "name": f"Machine_{machine_id}",
-                "site_name": site_name,
-                "type_name": "Unknown"
-            }
+        unique_ip_addresses = set(row[0] for row in telemetry_data)
 
-        # Load machine templates
+        # Batch query to get TypeName and Machine Unique Id from database by IPAddress
+        machine_types = {}
+        try:
+            connection = get_connection()
+            if connection:
+                cursor = connection.cursor()
+                if unique_ip_addresses:
+                    # Use batch query with IN clause for better performance
+                    placeholders = ','.join(['%s'] * len(unique_ip_addresses))
+                    ip_list = list(unique_ip_addresses)
+                    cursor.execute(
+                        f"SELECT `IPAddress`, `Machine Unique Id`, `TypeName`, `Name` FROM machines WHERE `IPAddress` IN ({placeholders})",
+                        ip_list
+                    )
+                    results = cursor.fetchall()
+                    for row in results:
+                        ip_address, machine_unique_id, type_name, name = row
+                        machine_types[ip_address] = {
+                            "machine_unique_id": machine_unique_id,
+                            "type_name": type_name,
+                            "name": name
+                        }
+                        print(f"[Import] IPAddress {ip_address}: Machine Unique Id = {machine_unique_id}, TypeName = {type_name}, Name = {name}", flush=True)
+
+                    # Log IP addresses not found in database
+                    found_ips = set(machine_types.keys())
+                    missing_ips = unique_ip_addresses - found_ips
+                    for ip in missing_ips:
+                        print(f"[Import] IPAddress {ip}: Not found in database", flush=True)
+                connection.close()
+            else:
+                print("[Import] Could not connect to database to fetch machine types", flush=True)
+        except Exception as e:
+            print(f"[Import] Error fetching machine types from database: {e}", flush=True)
+
+        for ip_address in unique_ip_addresses:
+            machine_info = machine_types.get(ip_address, {})
+            machines[ip_address] = {
+                "machine_unique_id": machine_info.get("machine_unique_id", ip_address),
+                "name": machine_info.get("name", f"Machine_{ip_address}"),
+                "site_name": site_name,
+                "type_name": machine_info.get("type_name", "Unknown")
+            }
+            print(f"[Import] Created machine entry: {machines[ip_address]}", flush=True)
+
+        # Load machine templates and machines list
         machine_templates = load_machine_templates(MACHINE_TEMPLATES_PATH)
+        machines_list = load_machines_list(MACHINES_LIST_PATH)
 
         # Process site with imported telemetry data and precomputed zones
-        set_import_status(site_name, "processing", 40, "Processing site data and generating simulation files...")
-        print(f"\n[Import] Starting process_site for {site_name}...", flush=True)
+        set_import_status(file_base_name, "processing", 40, "Processing site data and generating simulation files...")
+        print(f"\n[Import] Starting process_site for {file_base_name}...", flush=True)
         result = process_site(
             cursor=None,  # No database cursor needed for imported data
             site_name=site_name,
@@ -212,9 +266,13 @@ def process_import_and_export(
             zone_min_stops=config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count']),
             sim_time=config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time']),
             machine_templates=machine_templates,
+            machines_list=machines_list,
             telemetry_data=telemetry_data,
             coordinates_in_meters=True,  # Import data has coordinates in meters
             precomputed_zones=zones if zones else None,
+            output_base_name=file_base_name,  # Use import filename for output naming
+            export_model=export_model,
+            export_simulation=export_simulation,
         )
 
         print(f"\n[Import] process_site returned: {result is not None}", flush=True)
@@ -227,7 +285,7 @@ def process_import_and_export(
 
             print(f"[Import] Setting status to completed with files: {files}", flush=True)
             set_import_status(
-                site_name,
+                file_base_name,
                 "completed",
                 100,
                 "Import and export completed successfully",
@@ -236,13 +294,13 @@ def process_import_and_export(
             print(f"[Import] Status set to completed successfully!", flush=True)
         else:
             print(f"[Import] process_site returned None or empty result", flush=True)
-            set_import_status(site_name, "error", 0, "Failed to generate files")
+            set_import_status(file_base_name, "error", 0, "Failed to generate files")
 
     except Exception as e:
         import traceback
         print(f"[Import] Exception occurred: {str(e)}", flush=True)
         traceback.print_exc()
-        set_import_status(site_name, "error", 0, f"Error: {str(e)}")
+        set_import_status(file_base_name, "error", 0, f"Error: {str(e)}")
 
 
 @app.route('/api/sites', methods=['GET'])
@@ -269,10 +327,10 @@ def export_files():
     try:
         data = request.get_json()
         site_name = data.get('site_name')
-        
+
         if not site_name:
             return jsonify({"error": "site_name is required"}), 400
-        
+
         # Check if export is already in progress
         status = get_export_status(site_name)
         if status["status"] == "processing":
@@ -280,7 +338,7 @@ def export_files():
                 "error": "Export already in progress",
                 "status": status
             }), 409
-        
+
         # Get configuration from request or use defaults
         config = data.get('config', {})
         limit = config.get('limit', DEFAULT_CONFIG['data_fetching']['limit'])
@@ -291,7 +349,15 @@ def export_files():
         zone_grid_size = config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size'])
         zone_min_stops = config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])
         sim_time = config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])
-        
+
+        # Get export file type options (default both to True)
+        export_model = data.get('export_model', True)
+        export_simulation = data.get('export_simulation', True)
+
+        # At least one type must be selected
+        if not export_model and not export_simulation:
+            return jsonify({"error": "At least one export type must be selected"}), 400
+
         # Start export in background thread
         thread = threading.Thread(
             target=process_export,
@@ -305,16 +371,18 @@ def export_files():
                 zone_grid_size,
                 zone_min_stops,
                 sim_time,
+                export_model,
+                export_simulation,
             )
         )
         thread.daemon = True
         thread.start()
-        
+
         return jsonify({
             "message": "Export started",
             "site_name": site_name
         }), 202
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -329,30 +397,33 @@ def process_export(
     zone_grid_size: float,
     zone_min_stops: int,
     sim_time: int,
+    export_model: bool = True,
+    export_simulation: bool = True,
 ):
     """Process export in background thread."""
     try:
         set_export_status(site_name, "processing", 0, "Connecting to database...")
-        
+
         connection = get_connection()
         if not connection:
             set_export_status(site_name, "error", 0, "Failed to connect to database")
             return
-        
+
         try:
             cursor = connection.cursor()
-            
+
             # Fetch machines
             set_export_status(site_name, "processing", 10, "Fetching machine information...")
             machines = fetch_machines(cursor, site_name)
-            
+
             if not machines:
                 set_export_status(site_name, "error", 0, f"No machines found for site: {site_name}")
                 return
-            
-            # Load machine templates
+
+            # Load machine templates and machines list
             machine_templates = load_machine_templates(MACHINE_TEMPLATES_PATH)
-            
+            machines_list = load_machines_list(MACHINES_LIST_PATH)
+
             # Process site
             set_export_status(site_name, "processing", 20, "Processing site data...")
             result = process_site(
@@ -369,15 +440,18 @@ def process_export(
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,
                 machine_templates=machine_templates,
+                machines_list=machines_list,
+                export_model=export_model,
+                export_simulation=export_simulation,
             )
-            
+
             if result:
                 # Convert absolute paths to relative filenames
                 files = {}
                 for key, path in result.items():
                     if os.path.exists(path):
                         files[key] = os.path.basename(path)
-                
+
                 set_export_status(
                     site_name,
                     "completed",
@@ -387,10 +461,10 @@ def process_export(
                 )
             else:
                 set_export_status(site_name, "error", 0, "Failed to generate files")
-                
+
         finally:
             connection.close()
-            
+
     except Exception as e:
         set_export_status(site_name, "error", 0, f"Error: {str(e)}")
 
@@ -455,14 +529,27 @@ def download_file(site_name: str, file_type: str):
         file_path = os.path.join(OUTPUT_DIR, filename)
         if not os.path.exists(file_path):
             return jsonify({"error": "File not found on server"}), 404
-        
+
+        # Read file into memory, delete from disk, then send
+        with open(file_path, 'rb') as f:
+            file_data = io.BytesIO(f.read())
+
+        # Delete file after reading to optimize disk space
+        try:
+            os.remove(file_path)
+            print(f"[Cleanup] Deleted file after reading: {filename}", flush=True)
+        except Exception as e:
+            print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
+
+        # Determine mimetype based on file extension
+        mimetype = 'application/gzip' if filename.endswith('.gz') else 'application/json'
         return send_file(
-            file_path,
+            file_data,
             as_attachment=True,
             download_name=filename,
-            mimetype='application/json'
+            mimetype=mimetype
         )
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -471,15 +558,13 @@ def download_file(site_name: str, file_type: str):
 def import_files():
     """
     Import and parse raw data files.
-    
+
     Accepts:
-    - Single file upload
-    - Folder upload (as zip file)
-    - Multiple files
-    
+    - Single ZIP file containing raw data files
+
     Query parameters:
     - export: If "true", will also export simulation files after import
-    
+
     Returns parsed JSON data, or starts export process if export=true.
     """
     try:
@@ -490,15 +575,27 @@ def import_files():
         files = request.files.getlist('files')
         if not files or files[0].filename == '':
             return jsonify({"error": "No files selected"}), 400
-        
+
+        # Validate: only accept single .zip file
+        if len(files) != 1:
+            return jsonify({"error": "Please upload exactly one ZIP file"}), 400
+        if not files[0].filename.lower().endswith('.zip'):
+            return jsonify({"error": "Only ZIP files are allowed"}), 400
+
         # Get site_name from form data (optional, default to "DefaultSite")
         site_name = request.form.get('site_name', 'DefaultSite')
-        
+
+        # Get output_base_name from form data (used for output file naming)
+        # This allows naming output files based on input filename (e.g., ABC.zip -> ABC_model.json)
+        output_base_name = request.form.get('output_base_name', None)
+
         # Check if export is requested
         export_after_import = request.form.get('export', 'false').lower() == 'true'
         
         # Get export configuration from form data (optional)
         config = {}
+        export_model = True
+        export_simulation = True
         if export_after_import:
             config = {
                 'limit': int(request.form.get('limit', DEFAULT_CONFIG['data_fetching']['limit'])),
@@ -510,6 +607,13 @@ def import_files():
                 'zone_min_stops': int(request.form.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])),
                 'sim_time': int(request.form.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])),
             }
+            # Get export file type options
+            export_model = request.form.get('export_model', 'true').lower() == 'true'
+            export_simulation = request.form.get('export_simulation', 'true').lower() == 'true'
+
+            # At least one type must be selected
+            if not export_model and not export_simulation:
+                return jsonify({"error": "At least one export type must be selected"}), 400
         
         # Validate parser executable
         if not EXECUTE_FILE_PATH or not os.path.exists(EXECUTE_FILE_PATH):
@@ -607,6 +711,9 @@ def import_files():
             records = process_parser_output(parse_result)
             
             if export_after_import:
+                # Use output_base_name for SSE key and file naming
+                sse_key = output_base_name if output_base_name else site_name
+
                 # Start export in background thread
                 thread = threading.Thread(
                     target=process_import_and_export,
@@ -615,15 +722,19 @@ def import_files():
                         parse_result,
                         records,
                         config,
+                        output_base_name,  # Pass output_base_name for file naming
+                        export_model,
+                        export_simulation,
                     )
                 )
                 thread.daemon = True
                 thread.start()
-                
+
                 return jsonify({
                     "success": True,
                     "message": "Import completed, export started",
                     "site_name": site_name,
+                    "output_base_name": sse_key,  # Return the key for SSE subscription
                     "files_processed": len(file_paths),
                     "records_count": len(records),
                     "export_status": "processing"
@@ -692,7 +803,13 @@ def import_events_sse(site_name: str):
 
 @app.route('/api/import/download/<site_name>/<file_type>', methods=['GET'])
 def download_imported_file(site_name: str, file_type: str):
-    """Download exported file from import."""
+    """
+    Download exported file from import.
+
+    Args:
+        site_name: The output_base_name used during import (e.g., "ABC" for ABC.zip)
+        file_type: One of 'model', 'des_inputs', 'ledger'
+    """
     try:
         # Validate file type
         valid_types = ['model', 'des_inputs', 'ledger']
@@ -711,14 +828,27 @@ def download_imported_file(site_name: str, file_type: str):
         file_path = os.path.join(OUTPUT_DIR, filename)
         if not os.path.exists(file_path):
             return jsonify({"error": "File not found on server"}), 404
-        
+
+        # Read file into memory, delete from disk, then send
+        with open(file_path, 'rb') as f:
+            file_data = io.BytesIO(f.read())
+
+        # Delete file after reading to optimize disk space
+        try:
+            os.remove(file_path)
+            print(f"[Cleanup] Deleted file after reading: {filename}", flush=True)
+        except Exception as e:
+            print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
+
+        # Determine mimetype based on file extension
+        mimetype = 'application/gzip' if filename.endswith('.gz') else 'application/json'
         return send_file(
-            file_path,
+            file_data,
             as_attachment=True,
             download_name=filename,
-            mimetype='application/json'
+            mimetype=mimetype
         )
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

@@ -8,9 +8,9 @@ Uses logic from parse_gateway_messages.py to process parser output and convert t
 ACTUAL JSON STRUCTURE FROM GWMReader:
 {
     "CycleProdInfo": {
-        "208188426": [  // machineId as key
+        "208188426": [  // IPAddress as key
             [208188426, 1440799449, '2025-09-01T22:03:51.17', 95.185, 95.728, 8026.64, 12320.37, 276.73, 755.52, 12.2, 12, 12, 11.4, 9, 9.3, 0, -34, 7, 27, 5, 0, 58, 31, 0],
-            // ... 24 elements per record
+            // ... 24 elements per record (first element is IPAddress)
         ]
     }
 }
@@ -18,7 +18,7 @@ ACTUAL JSON STRUCTURE FROM GWMReader:
 VERIFIED COLUMN MAPPING (based on parse_gateway_messages.py):
 JSON Array Index | Database Column | Description | Unit/Notes
 -----------------|-----------------|-------------|------------
-[0]              | machineId | Machine Unique Id (208188426) | int
+[0]              | IPAddress | IP Address of machine (208188426) | int
 [1]              | segmentId | GPS timestamp (1440799449) | int (seconds since GPS epoch)
 [2]              | Time | ISO timestamp string ('2025-09-01T22:03:51.17') | datetime string
 [3]              | expectedElapsedTime | Expected elapsed (95.185) | float (already in seconds)
@@ -93,7 +93,7 @@ def parse_message_to_dict(data: List) -> Dict[str, Any]:
     Based on parse_gateway_messages.py logic.
 
     Raw data format (24 fields from parser):
-        0:  machineId
+        0:  IPAddress (machine IP address, used to lookup Machine Unique Id)
         1:  segmentId/cycleId
         2:  start_time
         3:  expectedElapsedTime
@@ -982,13 +982,13 @@ def convert_imported_records_to_telemetry(
     # Extract raw messages to get machineId, segmentId
     records_by_ip, _ = extract_cp_records(parser_output)
     
-    # Create mapping from record index to machineId, segmentId
+    # Create mapping from record index to IPAddress (stored as machineId key for backward compat), segmentId
     raw_messages = []
     for ip_address, messages in records_by_ip.items():
         for msg in messages:
             if len(msg) >= 24:
                 raw_messages.append({
-                    "machineId": int(msg[0]) if msg[0] is not None else 0,
+                    "machineId": int(msg[0]) if msg[0] is not None else 0,  # Actually IPAddress
                     "segmentId": int(msg[1]) if msg[1] is not None else 0,
                 })
     
@@ -1010,9 +1010,10 @@ def convert_imported_records_to_telemetry(
     for i, record in enumerate(tqdm(records, desc="Converting records", unit="rec")):
         raw_msg = raw_messages[i] if i < len(raw_messages) else {"machineId": 0, "segmentId": 0}
         
-        machine_id = raw_msg.get("machineId", 0)
+        # Note: machineId key actually contains IPAddress from parser output
+        machine_id = raw_msg.get("machineId", 0)  # Actually IPAddress
         segment_id = raw_msg.get("segmentId", 0)
-        
+
         # Use segmentId as cycle_id (common pattern in telemetry data)
         cycle_id = segment_id
 
@@ -1040,7 +1041,7 @@ def convert_imported_records_to_telemetry(
         
         # Create tuple in format expected by process_site
         telemetry_tuple = (
-            machine_id,        # 0: machine_id
+            machine_id,        # 0: IPAddress (used to lookup machine info)
             segment_id,        # 1: segment_id
             cycle_id,          # 2: cycle_id
             interval,          # 3: interval

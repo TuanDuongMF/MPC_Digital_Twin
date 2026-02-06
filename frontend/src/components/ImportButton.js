@@ -10,7 +10,23 @@ function ImportButton({ site, onImportComplete }) {
   const fileInputRef = useRef(null);
   const eventSourceRef = useRef(null);
 
+  // Export file type selection
+  const [exportModel, setExportModel] = useState(true);
+  const [exportSimulation, setExportSimulation] = useState(true);
+
   const DEFAULT_SITE_NAME = 'DefaultSite';
+  const [importBaseName, setImportBaseName] = useState(DEFAULT_SITE_NAME);
+
+  /**
+   * Extract base name from filename (remove extension).
+   * Example: "ABC.zip" -> "ABC", "data_file.gwm" -> "data_file"
+   */
+  const extractBaseName = (filename) => {
+    if (!filename) return DEFAULT_SITE_NAME;
+    // Remove extension
+    const lastDot = filename.lastIndexOf('.');
+    return lastDot > 0 ? filename.substring(0, lastDot) : filename;
+  };
 
   const handleFileSelect = (event) => {
     const files = event.target.files;
@@ -30,13 +46,13 @@ function ImportButton({ site, onImportComplete }) {
     };
   }, []);
 
-  const startSSE = () => {
+  const startSSE = (baseName) => {
     // Close existing connection if any
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
 
-    const eventSource = new EventSource(`/api/import/events/${encodeURIComponent(DEFAULT_SITE_NAME)}`);
+    const eventSource = new EventSource(`/api/import/events/${encodeURIComponent(baseName)}`);
     eventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
@@ -71,7 +87,7 @@ function ImportButton({ site, onImportComplete }) {
   const handleDownloadFile = async (fileType, filename) => {
     try {
       const response = await fetch(
-        `/api/import/download/${encodeURIComponent(DEFAULT_SITE_NAME)}/${fileType}`
+        `/api/import/download/${encodeURIComponent(importBaseName)}/${fileType}`
       );
       if (!response.ok) {
         throw new Error('Download failed');
@@ -91,6 +107,17 @@ function ImportButton({ site, onImportComplete }) {
   };
 
   const handleImport = async (files) => {
+    // Validate: only accept single .zip file
+    if (files.length !== 1) {
+      setError('Please upload exactly one ZIP file');
+      return;
+    }
+    const file = files[0];
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      setError('Only ZIP files are allowed');
+      return;
+    }
+
     try {
       setImporting(true);
       setStatus('uploading');
@@ -99,15 +126,21 @@ function ImportButton({ site, onImportComplete }) {
       setExportStatus(null);
       setExportFiles(null);
 
+      // Extract base name from first file (used for output naming)
+      const firstFileName = file.name;
+      const baseName = extractBaseName(firstFileName) || DEFAULT_SITE_NAME;
+      setImportBaseName(baseName);
+
       // Create FormData for multipart/form-data upload
       const formData = new FormData();
       formData.append('site_name', DEFAULT_SITE_NAME);
+      formData.append('output_base_name', baseName);  // Used for output file naming
       formData.append('export', 'true');
-      
-      // Add all files to FormData
-      for (let i = 0; i < files.length; i++) {
-        formData.append('files', files[i]);
-      }
+      formData.append('export_model', exportModel ? 'true' : 'false');
+      formData.append('export_simulation', exportSimulation ? 'true' : 'false');
+
+      // Add file to FormData
+      formData.append('files', file);
 
       // Upload files with progress tracking
       const xhr = new XMLHttpRequest();
@@ -124,8 +157,9 @@ function ImportButton({ site, onImportComplete }) {
       xhr.addEventListener('load', () => {
         if (xhr.status === 202) {
           // Export started (always expected since export=true)
+          let responseData;
           try {
-            JSON.parse(xhr.responseText);
+            responseData = JSON.parse(xhr.responseText);
           } catch (err) {
             setStatus('error');
             setError('Failed to parse response');
@@ -136,8 +170,9 @@ function ImportButton({ site, onImportComplete }) {
           setStatus('processing');
           setMessage('Import completed. Exporting simulation files...');
 
-          // Start SSE for real-time status updates
-          startSSE();
+          // Start SSE for real-time status updates (use output_base_name from response or local baseName)
+          const sseBaseName = responseData.output_base_name || baseName;
+          startSSE(sseBaseName);
           setImporting(false);
         } else {
           let serverMessage = `Server error: ${xhr.status}`;
@@ -242,6 +277,95 @@ function ImportButton({ site, onImportComplete }) {
           </div>
         )}
 
+        {/* Export Options */}
+        <div className="export-options">
+          <div className="export-options-header">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-2">
+              <path d="M4 22h14a2 2 0 0 0 2-2V7.5L14.5 2H6a2 2 0 0 0-2 2v4"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <path d="M3 15h6"></path>
+              <path d="M6 12v6"></path>
+            </svg>
+            <span className="export-options-title">Export Options</span>
+          </div>
+          <div className="export-options-grid">
+            <div
+              className={`export-option-item ${exportModel ? 'active' : ''} ${importing || status === 'processing' || (exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (importing || status === 'processing') return;
+                // Prevent turning off if it's the only one enabled
+                if (exportModel && !exportSimulation) return;
+                setExportModel(!exportModel);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon model">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <path d="M12 18v-6"></path>
+                    <path d="M9 15h6"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Model</span>
+                  <span className="export-option-desc">Site structure & config</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportModel}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportSimulation) return;
+                    setExportModel(e.target.checked);
+                  }}
+                  disabled={importing || status === 'processing'}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div
+              className={`export-option-item ${exportSimulation ? 'active' : ''} ${importing || status === 'processing' || (exportSimulation && !exportModel) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (importing || status === 'processing') return;
+                // Prevent turning off if it's the only one enabled
+                if (exportSimulation && !exportModel) return;
+                setExportSimulation(!exportSimulation);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon simulation">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M3 3v18h18"></path>
+                    <path d="M18 17V9"></path>
+                    <path d="M13 17V5"></path>
+                    <path d="M8 17v-3"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Simulation</span>
+                  <span className="export-option-desc">DES inputs & events</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportSimulation}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportModel) return;
+                    setExportSimulation(e.target.checked);
+                  }}
+                  disabled={importing || status === 'processing'}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
         {exportStatus === 'completed' && exportFiles && (
           <div className="mb-3 p-2 bg-success bg-opacity-10 rounded">
             <div className="d-flex align-items-center justify-content-between flex-wrap gap-2">
@@ -316,7 +440,7 @@ function ImportButton({ site, onImportComplete }) {
           <input
             ref={fileInputRef}
             type="file"
-            multiple
+            accept=".zip"
             style={{ display: 'none' }}
             onChange={handleFileSelect}
             disabled={importing}
@@ -339,10 +463,7 @@ function ImportButton({ site, onImportComplete }) {
                 <strong>Click to upload</strong> or drag and drop
               </p>
               <p className="text-muted small mb-0">
-                ZIP file or multiple raw data files (supports large files up to 5GB)
-              </p>
-              <p className="text-muted small mt-1 mb-0">
-                <em>Note: For folder upload, compress it as ZIP first</em>
+                ZIP file only (supports large files up to 5GB)
               </p>
             </div>
           )}

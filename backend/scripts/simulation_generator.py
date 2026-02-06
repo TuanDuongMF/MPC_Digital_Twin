@@ -17,8 +17,10 @@ CLI arguments override config file values.
 """
 
 import argparse
+import gzip
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
@@ -72,6 +74,12 @@ example_json_resolved = resolve_path(EXAMPLE_JSON_PATH, "../exampleJSON")
 MACHINE_TEMPLATES_PATH = os.path.join(
     example_json_resolved,
     "simulation", "machine_templates.json"
+)
+
+# Machines list file path (contains machine specs by model name like "793F", "797F", etc.)
+MACHINES_LIST_PATH = os.path.join(
+    example_json_resolved,
+    "machines_list.json"
 )
 
 # Default configuration values
@@ -195,6 +203,127 @@ def load_machine_templates(templates_path: Optional[str] = None) -> Dict[str, An
     
     # Return empty dict to signal using hardcoded defaults
     return {}
+
+
+def extract_machine_model(type_name: str) -> Optional[str]:
+    """
+    Extract machine model name from TypeName.
+
+    Examples:
+        "Cat798AC CMD" -> "798AC"
+        "Cat797F CMD" -> "797F"
+        "CAT 793F CMD - Coal" -> "793F"
+        "CA_CAT_793F-CMD" -> "793F"
+        "930E CMD" -> "930E"
+        "777G CMD" -> "777G"
+
+    Args:
+        type_name: TypeName from database (e.g., "Cat 793F CMD")
+
+    Returns:
+        Machine model name (e.g., "793F") or None if not found
+    """
+    if not type_name:
+        return None
+
+    # Pattern to match model numbers like: 793F, 798AC, 930E, 777G, 785NG, 794AC
+    # Model format: 3-4 digits followed by optional letters (F, AC, NG, E, G, D)
+    # Note: Don't use \b at start because TypeName may have no space (e.g., "Cat793NG CMD")
+    pattern = r'(\d{3,4}[A-Z]{0,3})\b'
+
+    match = re.search(pattern, type_name.upper())
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def load_machines_list(machines_list_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load machines list from JSON file.
+
+    The file contains machine specifications indexed by model name (e.g., "793F", "797F").
+    Structure is similar to model.json format.
+
+    Args:
+        machines_list_path: Path to machines_list.json file. If None, uses default path.
+
+    Returns:
+        Dictionary mapping model name to machine specification data
+    """
+    if machines_list_path is None:
+        machines_list_path = MACHINES_LIST_PATH
+    else:
+        # Resolve relative path if provided and not absolute
+        if not os.path.isabs(machines_list_path):
+            machines_list_path = os.path.join(backend_dir, machines_list_path)
+
+    if os.path.exists(machines_list_path):
+        try:
+            with open(machines_list_path, "r", encoding="utf-8") as f:
+                machines_list = json.load(f)
+            print(f"  Loaded machines list from: {machines_list_path}")
+            return machines_list
+        except Exception as e:
+            print(f"  Warning: Could not load machines list: {e}")
+            print(f"  Machine specs will use defaults")
+    else:
+        print(f"  Machines list file not found: {machines_list_path}")
+        print(f"  Machine specs will use defaults")
+
+    return {}
+
+
+def get_machine_spec_from_list(
+    type_name: str,
+    machines_list: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    Get machine specification from machines_list by TypeName.
+
+    The machines_list has format:
+    {
+        "version": "...",
+        "machine_list": {
+            "haulers": [
+                {"id": 1, "name": "777G", ...},
+                {"id": 2, "name": "793F", ...}
+            ],
+            "loaders": [...]
+        }
+    }
+
+    Args:
+        type_name: TypeName from database (e.g., "Cat 793F CMD")
+        machines_list: Dictionary loaded from machines_list.json
+
+    Returns:
+        Machine specification dict or None if not found
+    """
+    if not machines_list:
+        return None
+
+    model_name = extract_machine_model(type_name)
+    if not model_name:
+        return None
+
+    # Get haulers array from machine_list
+    machine_list_data = machines_list.get("machine_list", {})
+    haulers = machine_list_data.get("haulers", [])
+
+    # Search for hauler by name (exact match first)
+    for hauler in haulers:
+        if hauler.get("name") == model_name:
+            return hauler
+
+    # Try case-insensitive match
+    model_name_upper = model_name.upper()
+    for hauler in haulers:
+        hauler_name = hauler.get("name", "")
+        if hauler_name.upper() == model_name_upper:
+            return hauler
+
+    return None
 
 
 def deep_copy_dict(d: Dict) -> Dict:
@@ -1109,20 +1238,253 @@ def detect_zones(
     return load_zones, dump_zones
 
 
+def create_routes(
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    roads: List[Dict],
+    nodes: List[Dict],
+) -> List[Dict]:
+    """
+    Create routes connecting load zones to dump zones.
+
+    A route defines the path a hauler takes:
+    - Load at load_zone
+    - Haul (loaded) via haul roads to dump_zone
+    - Dump at dump_zone
+    - Return (empty) via return roads back to load_zone
+
+    Args:
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
+        roads: List of road dictionaries
+        nodes: List of node dictionaries
+
+    Returns:
+        List of route dictionaries with structure:
+        {
+            "id": int,
+            "name": str,
+            "haul": [road_ids],
+            "return": [road_ids],
+            "load_zone": int,
+            "dump_zone": int
+        }
+    """
+    if not load_zones or not dump_zones or not roads:
+        return []
+
+    # Build node lookup
+    node_lookup = {n["id"]: n for n in nodes}
+
+    # Build road lookup and connection graph
+    road_lookup = {r["id"]: r for r in roads}
+
+    # Build graph: node_id -> list of (road_id, other_endpoint_node_id)
+    # Each road connects its first node to its last node
+    node_to_roads = {}
+    for road in roads:
+        if len(road["nodes"]) < 2:
+            continue
+        start_node = road["nodes"][0]
+        end_node = road["nodes"][-1]
+
+        if start_node not in node_to_roads:
+            node_to_roads[start_node] = []
+        if end_node not in node_to_roads:
+            node_to_roads[end_node] = []
+
+        # Road can be traversed in both directions (2-way roads)
+        node_to_roads[start_node].append((road["id"], end_node))
+        node_to_roads[end_node].append((road["id"], start_node))
+
+    def find_path(start_node_id: int, end_node_id: int) -> List[int]:
+        """
+        Find a path of roads from start_node to end_node using BFS.
+        Returns list of road IDs forming the path.
+        """
+        if start_node_id == end_node_id:
+            return []
+
+        if start_node_id not in node_to_roads:
+            return []
+
+        # BFS to find path
+        from collections import deque
+        queue = deque([(start_node_id, [])])  # (current_node, road_path)
+        visited = {start_node_id}
+
+        while queue:
+            current_node, path = queue.popleft()
+
+            if current_node not in node_to_roads:
+                continue
+
+            for road_id, next_node in node_to_roads[current_node]:
+                if next_node in visited:
+                    continue
+
+                new_path = path + [road_id]
+
+                if next_node == end_node_id:
+                    return new_path
+
+                visited.add(next_node)
+                queue.append((next_node, new_path))
+
+        return []
+
+    routes = []
+    route_id = 1
+
+    for lz in load_zones:
+        lz_id = lz["id"]
+        lz_name = lz.get("name", f"Load zone {lz_id}")
+        lz_settings = lz.get("settings", {})
+        lz_outroad_ids = lz_settings.get("outroad_ids", [])
+        lz_outnode_ids = lz_settings.get("outnode_ids", [])
+        lz_inroad_ids = lz_settings.get("inroad_ids", [])
+        lz_innode_ids = lz_settings.get("innode_ids", [])
+
+        for dz in dump_zones:
+            dz_id = dz["id"]
+            dz_name = dz.get("name", f"Dump zone {dz_id}")
+            dz_settings = dz.get("settings", {})
+            dz_inroad_ids = dz_settings.get("inroad_ids", [])
+            dz_innode_ids = dz_settings.get("innode_ids", [])
+            dz_outroad_ids = dz_settings.get("outroad_ids", [])
+            dz_outnode_ids = dz_settings.get("outnode_ids", [])
+
+            # Determine haul path: from load_zone exit to dump_zone entry
+            haul_roads = []
+            if lz_outroad_ids and dz_inroad_ids:
+                # If both zones connect to the same road, that's the haul road
+                if lz_outroad_ids[0] == dz_inroad_ids[0]:
+                    haul_roads = [lz_outroad_ids[0]]
+                else:
+                    # Try to find path from load_zone exit node to dump_zone entry node
+                    if lz_outnode_ids and dz_innode_ids:
+                        path = find_path(lz_outnode_ids[0], dz_innode_ids[0])
+                        if path:
+                            haul_roads = path
+                        else:
+                            # Fallback: use both roads if no path found
+                            haul_roads = lz_outroad_ids + [r for r in dz_inroad_ids if r not in lz_outroad_ids]
+                    else:
+                        haul_roads = lz_outroad_ids
+            elif lz_outroad_ids:
+                haul_roads = lz_outroad_ids
+
+            # Determine return path: from dump_zone exit to load_zone entry
+            return_roads = []
+            if dz_outroad_ids and lz_inroad_ids:
+                # If both zones connect to the same road, that's the return road
+                if dz_outroad_ids[0] == lz_inroad_ids[0]:
+                    return_roads = [dz_outroad_ids[0]]
+                else:
+                    # Try to find path from dump_zone exit node to load_zone entry node
+                    if dz_outnode_ids and lz_innode_ids:
+                        path = find_path(dz_outnode_ids[0], lz_innode_ids[0])
+                        if path:
+                            return_roads = path
+                        else:
+                            # Fallback: use both roads if no path found
+                            return_roads = dz_outroad_ids + [r for r in lz_inroad_ids if r not in dz_outroad_ids]
+                    else:
+                        return_roads = dz_outroad_ids
+            elif dz_outroad_ids:
+                return_roads = dz_outroad_ids
+
+            # If no specific roads found, use all roads as fallback
+            if not haul_roads:
+                haul_roads = [r["id"] for r in roads]
+            if not return_roads:
+                return_roads = list(reversed([r["id"] for r in roads]))
+
+            route = {
+                "id": route_id,
+                "name": f"{lz_name} to {dz_name}",
+                "haul": haul_roads,
+                "return": return_roads,
+                "load_zone": lz_id,
+                "dump_zone": dz_id,
+            }
+            routes.append(route)
+            route_id += 1
+
+    return routes
+
+
 def create_model(
     nodes: List[Dict],
     roads: List[Dict],
     load_zones: List[Dict] = None,
     dump_zones: List[Dict] = None,
     version: str = "2.0.51",
+    machines: Optional[Dict[int, Dict]] = None,
+    machines_list: Optional[Dict[str, Any]] = None,
+    machines_with_events: Optional[Set[int]] = None,
+    telemetry_data: Optional[List[Tuple]] = None,
+    coordinates_in_meters: bool = False,
 ) -> Dict:
-    """Create complete model structure with full settings from example_model.json."""
+    """
+    Create complete model structure with full settings.
+
+    Args:
+        nodes: List of node dictionaries
+        roads: List of road dictionaries
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
+        version: Model version string
+        machines: Machine info dictionary (from database or import)
+        machines_list: Machine specifications by model name (from machines_list.json)
+        machines_with_events: Set of machine IDs that have events data
+        telemetry_data: Raw telemetry data for determining hauler initial positions
+        coordinates_in_meters: Whether telemetry coordinates are in meters (True) or mm (False)
+
+    Returns:
+        Complete model dictionary
+    """
     load_zones = load_zones or []
     dump_zones = dump_zones or []
-    
+
+    # Build machine_list from machines using machines_list.json data
+    machine_list_haulers = []
+    machine_list_loaders = []
+    added_model_names = set()  # Track added models to avoid duplicates
+    model_name_to_machine_list_id = {}  # Map model_name -> machine_list hauler id
+
+    if machines and machines_list:
+        for machine_id, machine_info in machines.items():
+            # Skip machines without events if filter is provided
+            if machines_with_events is not None and machine_id not in machines_with_events:
+                continue
+
+            type_name = machine_info.get("type_name", "Unknown")
+            model_name = extract_machine_model(type_name)
+
+            if model_name and model_name not in added_model_names:
+                # Get spec from machines_list.json
+                spec_data = get_machine_spec_from_list(type_name, machines_list)
+                if spec_data:
+                    hauler_data = deep_copy_dict(spec_data)
+                    hauler_data["model_name"] = type_name
+                    machine_list_haulers.append(hauler_data)
+                    # Track mapping from model_name to machine_list hauler id
+                    model_name_to_machine_list_id[model_name] = hauler_data.get("id", len(machine_list_haulers))
+                    added_model_names.add(model_name)
+
+    # Add default loader from machines_list.json (first loader available)
+    default_loader_machine_list_id = None
+    if machines_list:
+        loaders_in_list = machines_list.get("machine_list", {}).get("loaders", [])
+        if loaders_in_list:
+            default_loader = deep_copy_dict(loaders_in_list[0])
+            machine_list_loaders.append(default_loader)
+            default_loader_machine_list_id = default_loader.get("id", 1)
+
     model = {
         "version": version,
-        "machine_list": {"haulers": [], "loaders": []},
+        "machine_list": {"haulers": machine_list_haulers, "loaders": machine_list_loaders},
         "map_id": -1,
         "map_translate": {"total_northing": 0, "total_easting": 0, "total_elevation": 0, "total_angle": 0},
         "parameters": [],
@@ -1332,7 +1694,7 @@ def create_model(
         "service_stations": [],
         "dump_zones": dump_zones,
         "load_zones": load_zones,
-        "routes": [],
+        "routes": create_routes(load_zones, dump_zones, roads, nodes),
         "haulers": [],
         "loaders": [],
         "simulates": [],
@@ -1342,21 +1704,196 @@ def create_model(
         "cameraPosition": {"x": 0, "y": 1000, "z": 0},
         "controlTarget": {"x": 0, "y": 0, "z": 0},
     }
-    
+
+    # Build haulers list from machines
+    model_haulers = []
+    if machines and model_name_to_machine_list_id:
+        routes = model.get("routes", [])
+        first_route_id = routes[0]["id"] if routes else None
+
+        # Build lookup structures for determining initial positions
+        node_lookup = {n["id"]: n for n in nodes}
+        road_lookup = {r["id"]: r for r in roads}
+
+        # Build mapping: node_id -> list of road_ids that contain this node
+        node_to_roads = {}
+        for road in roads:
+            for nid in road.get("nodes", []):
+                if nid not in node_to_roads:
+                    node_to_roads[nid] = []
+                node_to_roads[nid].append(road["id"])
+
+        # Build mapping: road_id -> list of route_ids that use this road
+        road_to_routes = {}
+        for route in routes:
+            for rid in route.get("haul", []) + route.get("return", []):
+                if rid not in road_to_routes:
+                    road_to_routes[rid] = []
+                road_to_routes[rid].append(route["id"])
+
+        # Group telemetry by machine_id to find first position
+        machine_first_positions = {}
+        if telemetry_data:
+            for row in telemetry_data:
+                mid = row[0]
+                if mid not in machine_first_positions:
+                    # First telemetry point for this machine
+                    # row[4]=pathEasting, row[5]=pathNorthing, row[6]=pathElevation
+                    if coordinates_in_meters:
+                        x, y, z = row[4], row[5], row[6]
+                    else:
+                        x = row[4] / 1000.0
+                        y = row[5] / 1000.0
+                        z = row[6] / 1000.0
+                    machine_first_positions[mid] = (x, y, z)
+
+        def find_nearest_node(x: float, y: float) -> Optional[int]:
+            """Find nearest node to given coordinates."""
+            min_dist = float('inf')
+            nearest_node_id = None
+            for node in nodes:
+                nx, ny = node["coords"][0], node["coords"][1]
+                dist = (x - nx) ** 2 + (y - ny) ** 2
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_node_id = node["id"]
+            return nearest_node_id
+
+        hauler_id = 1
+        for machine_id, machine_info in machines.items():
+            # Skip machines without events if filter is provided
+            if machines_with_events is not None and machine_id not in machines_with_events:
+                continue
+
+            type_name = machine_info.get("type_name", "Unknown")
+            model_name = extract_machine_model(type_name)
+
+            # Get machine_list hauler id for this model
+            machine_list_id = model_name_to_machine_list_id.get(model_name)
+            if machine_list_id is None:
+                continue
+
+            # Determine initial position from telemetry data
+            init_node_id = None
+            init_road_id = None
+            init_route_id = first_route_id
+
+            first_pos = machine_first_positions.get(machine_id)
+            if first_pos and nodes:
+                x, y, z = first_pos
+                init_node_id = find_nearest_node(x, y)
+
+                # Find road containing this node
+                if init_node_id and init_node_id in node_to_roads:
+                    road_ids = node_to_roads[init_node_id]
+                    if road_ids:
+                        init_road_id = road_ids[0]
+
+                        # Find route using this road
+                        if init_road_id in road_to_routes:
+                            route_ids = road_to_routes[init_road_id]
+                            if route_ids:
+                                init_route_id = route_ids[0]
+
+            # Get machine spec to determine type
+            spec_data = get_machine_spec_from_list(type_name, machines_list) if machines_list else None
+            machine_type = spec_data.get("type", "diesel") if spec_data else "diesel"
+            is_electric = machine_type == "electric"
+
+            hauler = {
+                "id": hauler_id,
+                "group_id": hauler_id,
+                "key": "haulers",
+                "name": f"Hauler {hauler_id}",
+                "machine_id": machine_list_id,
+                "is_local_machine": None,
+                "geometry_name": "_default",
+                "model_scale": 1,
+                "type": machine_type,
+                "number_of_haulers": 1,
+                "lane": 2,
+                "initial_position": 1,  # 1 = on route
+                "initial_level_pct": {
+                    "type": "exact",
+                    "value": 95
+                },
+                "initial_conditions": {
+                    "route_id": init_route_id,
+                    "road_id": init_road_id,
+                    "node_id": init_node_id,
+                    "service_zone_id": None,
+                    "service_zone_spot_id": None,
+                    "load_zone_id": None,
+                    "assigned_load_spots": []
+                },
+                "is_deactive": False
+            }
+
+            # Add type-specific fields
+            if is_electric:
+                hauler["battery_state_of_health"] = 90
+                hauler["battery_capacity"] = spec_data.get("battery_size", 500) if spec_data else 500
+            else:
+                hauler["fuel_tank"] = spec_data.get("fuel_tank", 3785) if spec_data else 3785
+
+            model_haulers.append(hauler)
+            hauler_id += 1
+
+    model["haulers"] = model_haulers
+
+    # Build loaders list from load_zones (one loader per load_zone)
+    model_loaders = []
+    if load_zones and default_loader_machine_list_id is not None:
+        # Get default loader spec for configured string
+        default_loader_spec = machine_list_loaders[0] if machine_list_loaders else None
+        loader_model_name = default_loader_spec.get("name", "Unknown") if default_loader_spec else "Unknown"
+        loader_model_id = default_loader_spec.get("model_id", "") if default_loader_spec else ""
+
+        loader_id = 1
+        for lz in load_zones:
+            lz_id = lz.get("id")
+            lz_name = lz.get("name", f"Load zone {lz_id}")
+
+            # Get number of spots from load zone settings
+            lz_settings = lz.get("settings", {})
+            n_spots = lz_settings.get("n_spots", 1)
+            assigned_spots = list(range(1, n_spots + 1)) if n_spots > 0 else [1]
+
+            loader = {
+                "id": loader_id,
+                "name": f"Loader {loader_id}",
+                "key": "loaders",
+                "machine_id": default_loader_machine_list_id,
+                "configured": f"{loader_model_name} (ID: {loader_model_id})",
+                "used_for": "Truck Loading",
+                "fill_factor_pct": 100,
+                "initial_charge_fuel_levels_pct": 95,
+                "initial_conditions": {
+                    "load_zone_id": lz_id,
+                    "assigned_load_spots": assigned_spots
+                },
+                "is_deactive": False
+            }
+
+            model_loaders.append(loader)
+            loader_id += 1
+
+    model["loaders"] = model_loaders
+
     # Update camera position
     if nodes:
         eastings = [n["coords"][0] for n in nodes]
         northings = [n["coords"][1] for n in nodes]
         elevations = [n["coords"][2] for n in nodes]
-        
+
         center_x = (min(eastings) + max(eastings)) / 2
         center_y = (min(northings) + max(northings)) / 2
         center_z = (min(elevations) + max(elevations)) / 2
         span = max(max(eastings) - min(eastings), max(northings) - min(northings))
-        
+
         model["cameraPosition"] = {"x": center_x, "y": center_z + span, "z": center_y}
         model["controlTarget"] = {"x": center_x, "y": center_z, "z": center_y}
-    
+
     return model
 
 
@@ -1544,7 +2081,7 @@ def create_des_inputs(
 ) -> Dict:
     """
     Create DES Inputs structure from model and machine data.
-    
+
     Args:
         model: Model dictionary with nodes, roads, zones
         machines: Machine info dictionary
@@ -1552,7 +2089,7 @@ def create_des_inputs(
         sim_time: Simulation time in minutes
         machines_with_events: Set of machine IDs that have events data
         machine_templates: Machine templates loaded from JSON file
-    
+
     Returns:
         DES Inputs dictionary
     """
@@ -1624,11 +2161,11 @@ def create_des_inputs(
                 hauler_machine = hauler_spec.get("machine", {}).get("machine", {})
                 hauler_machine["ID"] = spec_id
                 hauler_machine["Model"] = machine_type_name
-                
+
                 # Update tires ID
                 for tire in hauler_spec.get("machine", {}).get("tires", []):
                     tire["ID"] = spec_id
-                
+
                 # Apply electric overrides if needed
                 if is_electric and electric_hauler_overrides:
                     hauler_spec = merge_dict(hauler_spec, electric_hauler_overrides)
@@ -1636,14 +2173,14 @@ def create_des_inputs(
                     if "machine" in hauler_spec:
                         hauler_spec["machine"]["machine"]["ID"] = spec_id
                         hauler_spec["machine"]["machine"]["Model"] = machine_type_name
-                
+
                 hauler_specs[str(spec_id)] = hauler_spec
             else:
                 # Fallback to hardcoded defaults
                 hauler_specs[str(spec_id)] = _create_default_hauler_spec(
                     spec_id, machine_type_name, is_electric
                 )
-            
+
             model_to_spec_id[machine_type_name] = spec_id
             spec_id += 1
         
@@ -2035,43 +2572,30 @@ def create_des_inputs(
             loaders.append(loader_entry)
             loader_id += 1
 
-    # Create routes from load zones to dump zones
-    # Routes only contain main roads - zone roads are part of zones, not routes
+    # Create routes from load zones to dump zones using pathfinding
+    # Use model routes as base and add DES-specific fields
+    model_routes = model.get("routes", [])
     des_routes = []
-    route_id = 1
-    route_uid_counter = 1000  # Start UID counter for routes
-    
-    # Get main road IDs only (original roads, not zone-specific roads)
+    route_uid_counter = 1000
+
+    # Get main road IDs as fallback
     main_road_ids = [road["id"] for road in roads]
-    
-    for lz in des_load_zones:
-        lz_id = lz["id"]
-        lz_name = lz["name"]
-        
-        for dz in des_dump_zones:
-            dz_id = dz["id"]
-            dz_name = dz["name"]
-            
-            # Routes use only main roads to connect zones
-            # Haul: main roads from load zone to dump zone
-            haul_roads = list(main_road_ids)
-            
-            # Return: main roads reversed (from dump zone back to load zone)
-            return_roads = list(reversed(main_road_ids))
-            
-            # Create route
+
+    if model_routes:
+        # Use routes from model (already computed with proper pathfinding)
+        for model_route in model_routes:
             route = {
-                "id": route_id,
-                "name": f"{lz_name} to {dz_name}",
-                "haul": haul_roads,
-                "return": return_roads,
+                "id": model_route["id"],
+                "name": model_route["name"],
+                "haul": model_route["haul"],
+                "return": model_route["return"],
                 "start_zone": {
-                    "id": lz_id,
+                    "id": model_route["load_zone"],
                     "type": "lz",
                     "uid": route_uid_counter,
                 },
                 "end_zone": {
-                    "id": dz_id,
+                    "id": model_route["dump_zone"],
                     "type": "dz",
                     "uid": route_uid_counter + 1,
                 },
@@ -2080,9 +2604,41 @@ def create_des_inputs(
                 "uid": route_uid_counter + 2,
             }
             des_routes.append(route)
-            route_id += 1
             route_uid_counter += 3
-    
+    else:
+        # Fallback: create routes for all load_zone-dump_zone pairs
+        route_id = 1
+        for lz in des_load_zones:
+            lz_id = lz["id"]
+            lz_name = lz["name"]
+
+            for dz in des_dump_zones:
+                dz_id = dz["id"]
+                dz_name = dz["name"]
+
+                route = {
+                    "id": route_id,
+                    "name": f"{lz_name} to {dz_name}",
+                    "haul": list(main_road_ids),
+                    "return": list(reversed(main_road_ids)),
+                    "start_zone": {
+                        "id": lz_id,
+                        "type": "lz",
+                        "uid": route_uid_counter,
+                    },
+                    "end_zone": {
+                        "id": dz_id,
+                        "type": "dz",
+                        "uid": route_uid_counter + 1,
+                    },
+                    "used_by_current_MMP": True,
+                    "production": True,
+                    "uid": route_uid_counter + 2,
+                }
+                des_routes.append(route)
+                route_id += 1
+                route_uid_counter += 3
+
     # If no routes created (no zones), create a default route using main roads
     if not des_routes and main_road_ids:
         des_routes.append({
@@ -2254,9 +2810,13 @@ def process_site(
     zone_min_stops: int = 20,
     sim_time: int = 480,
     machine_templates: Optional[Dict[str, Any]] = None,
+    machines_list: Optional[Dict[str, Any]] = None,
     telemetry_data: Optional[List[Tuple]] = None,
     coordinates_in_meters: Optional[bool] = None,
     precomputed_zones: Optional[List] = None,
+    output_base_name: Optional[str] = None,
+    export_model: bool = True,
+    export_simulation: bool = True,
 ) -> Dict[str, str]:
     """
     Process site data and generate all output files.
@@ -2275,12 +2835,17 @@ def process_site(
         zone_min_stops: Minimum stops for zone detection
         sim_time: Simulation time
         machine_templates: Machine templates dictionary
+        machines_list: Machine specifications by model name (e.g., "793F" -> spec data)
         telemetry_data: Optional pre-fetched telemetry data (list of tuples)
         coordinates_in_meters: If True, coordinates are in meters (import flow).
                               If False, coordinates are in millimeters (database flow).
                               If None, will be determined based on data source.
         precomputed_zones: Optional list of Reader.Zone objects from parse_cp1_data.
                           If provided, uses these instead of detect_zones().
+        output_base_name: Optional base name for output files (e.g., "ABC" -> "ABC_model.json").
+                         If not provided, uses site_name.
+        export_model: If True, generate model.json file.
+        export_simulation: If True, generate des_inputs.json.gz and ledger.json.gz files.
 
     Returns:
         Dictionary with paths to generated files
@@ -2371,113 +2936,130 @@ def process_site(
             coordinates_in_meters=coordinates_in_meters
         )
     print(f"    Found {len(load_zones)} load zones, {len(dump_zones)} dump zones")
-    
-    # Create model
-    model = create_model(nodes, roads, load_zones, dump_zones)
-    
-    # Generate events
-    print("  [4/5] Generating simulation events...")
-    converter = GPSToEventsConverter(model_data=model)
-    
-    all_events = []
-    machine_data = {}
-    machines_with_events: Set[int] = set()
-    for row in telemetry_data:
-        mid = row[0]
-        if mid not in machine_data:
-            machine_data[mid] = []
-        machine_data[mid].append(row)
-    
-    machine_iterator = machine_data.items()
-    if TQDM_AVAILABLE:
-        machine_iterator = tqdm(list(machine_iterator), desc="    Machines", unit="machine")
-    
-    for machine_id, data in machine_iterator:
-        machine_info = machines.get(machine_id, {})
-        machine_name = machine_info.get("name", f"Machine_{machine_id}")
-        
-        events = converter.convert_raw_telemetry(
-            data,
-            machine_id=machine_id,
-            machine_name=machine_name,
-            # Use smaller node spacing and larger search radius
-            # so haulers follow more nodes along the road network.
-            min_node_distance=5.0,
-            max_search_distance=150.0,
-            # Pass coordinates_in_meters to ensure consistent unit conversion
-            # between road creation and event generation
-            coordinates_in_meters=coordinates_in_meters,
-        )
 
-        # Only keep machines that actually generated events
-        if events:
-            machines_with_events.add(machine_id)
-            all_events.extend(events)
-
-        converter.reset()
-    
-    # Sort events by time and renumber
-    all_events.sort(key=lambda e: (e.get("time", 0), e.get("eid", 0)))
-    
-    # Normalize time to start from 0 (all times in minutes from simulation start)
-    if all_events:
-        min_time = min(e.get("time", 0) for e in all_events)
-        for event in all_events:
-            event["time"] = round(event["time"] - min_time, 4)
-    
-    # Renumber events after sorting
-    for i, event in enumerate(all_events):
-        event["eid"] = i + 1
-    
-    print(f"    Generated {len(all_events):,} events")
-    
-    # Generate DES Inputs - only include machines that have events
-    print("  [5/5] Generating DES inputs...")
-    des_inputs = create_des_inputs(
-        model, machines, site_name, sim_time, machines_with_events, machine_templates
+    # Create model with machine_list from machines_list.json
+    model = create_model(
+        nodes, roads, load_zones, dump_zones,
+        machines=machines,
+        machines_list=machines_list,
+        telemetry_data=telemetry_data,
+        coordinates_in_meters=coordinates_in_meters,
     )
-    
-    # Save all files
-    safe_name = site_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Save model
-    model_path = os.path.join(output_dir, f"model_{safe_name}.json")
-    with open(model_path, "w", encoding="utf-8") as f:
-        json.dump(model, f, indent=2)
-    
-    # Save DES inputs
-    des_inputs_path = os.path.join(output_dir, f"des_inputs_{safe_name}.json")
-    with open(des_inputs_path, "w", encoding="utf-8") as f:
-        json.dump(des_inputs, f, indent=2)
-    
-    # Save events ledger
-    events_output = {
-        "status": True,
-        "data": {
-            "version": "20250818",
-            "events": all_events,
-            "summary": {
-                "total_events": len(all_events),
-                "total_haulers": len(machine_data),
-                "simulation_duration_minutes": max((e.get("time", 0) for e in all_events), default=0),
-            },
-        },
-    }
-    ledger_path = os.path.join(output_dir, f"simulation_ledger_{safe_name}.json")
-    with open(ledger_path, "w", encoding="utf-8") as f:
-        json.dump(events_output, f, indent=2, default=str)
-    
-    print(f"\n  Output files saved to: {output_dir}", flush=True)
-    print(f"    - Model: model_{safe_name}.json ({len(nodes)} nodes, {len(roads)} roads)", flush=True)
-    print(f"    - DES Inputs: des_inputs_{safe_name}.json ({len(des_inputs['haulers'])} haulers)", flush=True)
-    print(f"    - Events Ledger: simulation_ledger_{safe_name}.json ({len(all_events)} events)", flush=True)
 
-    result = {
-        "model": model_path,
-        "des_inputs": des_inputs_path,
-        "ledger": ledger_path,
-    }
+    # Generate events and DES inputs (only if export_simulation is True)
+    all_events = []
+    des_inputs = {}
+    machines_with_events: Set[int] = set()
+
+    if export_simulation:
+        print("  [4/5] Generating simulation events...")
+        converter = GPSToEventsConverter(model_data=model)
+
+        machine_data = {}
+        for row in telemetry_data:
+            mid = row[0]
+            if mid not in machine_data:
+                machine_data[mid] = []
+            machine_data[mid].append(row)
+
+        machine_iterator = machine_data.items()
+        if TQDM_AVAILABLE:
+            machine_iterator = tqdm(list(machine_iterator), desc="    Machines", unit="machine")
+
+        for machine_id, data in machine_iterator:
+            machine_info = machines.get(machine_id, {})
+            machine_name = machine_info.get("name", f"Machine_{machine_id}")
+
+            events = converter.convert_raw_telemetry(
+                data,
+                machine_id=machine_id,
+                machine_name=machine_name,
+                # Use smaller node spacing and larger search radius
+                # so haulers follow more nodes along the road network.
+                min_node_distance=5.0,
+                max_search_distance=150.0,
+                # Pass coordinates_in_meters to ensure consistent unit conversion
+                # between road creation and event generation
+                coordinates_in_meters=coordinates_in_meters,
+            )
+
+            # Only keep machines that actually generated events
+            if events:
+                machines_with_events.add(machine_id)
+                all_events.extend(events)
+
+            converter.reset()
+
+        # Sort events by time and renumber
+        all_events.sort(key=lambda e: (e.get("time", 0), e.get("eid", 0)))
+
+        # Normalize time to start from 0 (all times in minutes from simulation start)
+        if all_events:
+            min_time = min(e.get("time", 0) for e in all_events)
+            for event in all_events:
+                event["time"] = round(event["time"] - min_time, 4)
+
+        # Renumber events after sorting
+        for i, event in enumerate(all_events):
+            event["eid"] = i + 1
+
+        print(f"    Generated {len(all_events):,} events")
+
+        # Generate DES Inputs - only include machines that have events
+        print("  [5/5] Generating DES inputs...")
+        des_inputs = create_des_inputs(
+            model, machines, site_name, sim_time, machines_with_events, machine_templates
+        )
+    else:
+        print("  [4/5] Skipping simulation events (export_simulation=False)")
+        print("  [5/5] Skipping DES inputs (export_simulation=False)")
+    
+    # Save files based on export options
+    # Use output_base_name if provided, otherwise use site_name
+    file_base = output_base_name if output_base_name else site_name
+    safe_name = file_base.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    os.makedirs(output_dir, exist_ok=True)
+
+    result = {}
+    print(f"\n  Output files saved to: {output_dir}", flush=True)
+
+    # Save model (if export_model is True)
+    if export_model:
+        model_path = os.path.join(output_dir, f"{safe_name}_model.json")
+        with open(model_path, "w", encoding="utf-8") as f:
+            json.dump(model, f, indent=2)
+        result["model"] = model_path
+        print(f"    - Model: {safe_name}_model.json ({len(nodes)} nodes, {len(roads)} roads)", flush=True)
+
+    # Save simulation files (if export_simulation is True)
+    if export_simulation:
+        # Save DES inputs (gzip compressed)
+        des_inputs_path = os.path.join(output_dir, f"{safe_name}_des_inputs.json.gz")
+        with gzip.open(des_inputs_path, "wb") as f:
+            f.write(json.dumps(des_inputs, indent=2).encode("utf-8"))
+        result["des_inputs"] = des_inputs_path
+        print(f"    - DES Inputs: {safe_name}_des_inputs.json.gz ({len(des_inputs['haulers'])} haulers)", flush=True)
+
+        # Save events ledger
+        events_output = {
+            "status": True,
+            "data": {
+                "version": "20250818",
+                "events": all_events,
+                "summary": {
+                    "total_events": len(all_events),
+                    "total_haulers": len(machine_data),
+                    "simulation_duration_minutes": max((e.get("time", 0) for e in all_events), default=0),
+                },
+            },
+        }
+        # Save events ledger (gzip compressed)
+        ledger_path = os.path.join(output_dir, f"{safe_name}_ledger.json.gz")
+        with gzip.open(ledger_path, "wb") as f:
+            f.write(json.dumps(events_output, indent=2, default=str).encode("utf-8"))
+        result["ledger"] = ledger_path
+        print(f"    - Events Ledger: {safe_name}_ledger.json.gz ({len(all_events)} events)", flush=True)
+
     print(f"\n  [process_site] Returning result: {list(result.keys())}", flush=True)
     return result
 
@@ -2667,15 +3249,16 @@ Config file parameters can be overridden by CLI arguments.
         
         # Load machine templates
         machine_templates = load_machine_templates(machine_templates_path)
-        
+        machines_list = load_machines_list()
+
         for idx, site_name in enumerate(sites_to_process, 1):
             if len(sites_to_process) > 1:
                 print(f"\n{'='*70}")
                 print(f"  Site {idx}/{len(sites_to_process)}: {site_name}")
                 print(f"{'='*70}")
-            
+
             machines = fetch_machines(cursor, site_name)
-            
+
             result = process_site(
                 cursor,
                 site_name,
@@ -2690,6 +3273,7 @@ Config file parameters can be overridden by CLI arguments.
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,
                 machine_templates=machine_templates,
+                machines_list=machines_list,
             )
             
             if result:

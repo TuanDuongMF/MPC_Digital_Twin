@@ -13,6 +13,11 @@ This document describes the data structures for MineOpt simulation models. The m
 3. [Roads](#roads)
 4. [Load Zones](#load-zones)
 5. [Dump Zones](#dump-zones)
+6. [Routes](#routes)
+7. [Machine List](#machine-list)
+8. [Haulers](#haulers)
+9. [Loaders](#loaders)
+10. [Operations - Material Schedules](#operations---material-schedules)
 
 ---
 
@@ -335,4 +340,447 @@ Areas where haulers dump their payload. Zones are auto-generated based on settin
 
 ---
 
-*Document generated based on codebase analysis of PDM-Mineopt_Client.*
+---
+
+## Routes
+
+Routes define the paths that haulers take between load zones and dump zones.
+
+### Structure
+
+```json
+{
+  "id": 1,
+  "name": "Route 1",
+  "haul": [1, 2, 3],
+  "return": [4, 5, 6],
+  "load_zone": 1,
+  "dump_zone": 1
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | number | Yes | Unique route identifier |
+| `name` | string | Yes | Display name of the route |
+| `haul` | number[] | Yes | Array of road IDs forming the haul (loaded) path |
+| `return` | number[] | Yes | Array of road IDs forming the return (empty) path |
+| `load_zone` | number | Yes | ID of the load zone where haulers load material |
+| `dump_zone` | number | Yes | ID of the dump zone where haulers dump material |
+
+### Simulation Runtime Properties
+
+During simulation, routes are enriched with additional properties:
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `materialGenerate` | boolean | - | Whether route generates material |
+| `production` | boolean | - | Production status |
+| `road_trolley_length` | object | - | Mapping of road trolley lengths |
+| `trolley_total_length` | number | meters | Total trolley line distance |
+| `road_length` | number | meters | Total road distance |
+| `total_power` | number | kW | Total power required |
+| `min_cycle_time` | number | hours | Minimum cycle time |
+| `trolley_percent` | number | % | Percentage of route with trolley |
+| `energy` | number | kWh | Energy consumption |
+| `net_energy` | number | kWh | Net energy consumption |
+| `material_movement.planned` | number | tonnes | Planned material movement |
+| `material_movement.actual` | number | tonnes | Actual material movement |
+
+---
+
+## Machine List
+
+The machine list contains available machine specifications for haulers and loaders.
+
+### Structure
+
+```json
+{
+  "haulers": [],
+  "loaders": []
+}
+```
+
+### Hauler Machine Item (`machine_list.haulers`)
+
+```json
+{
+  "id": 1,
+  "type": "diesel",
+  "name": "Hauler_Config_A",
+  "dump_time": 0.5,
+  "fleet_type": "staffed",
+  "accel_limit": 99,
+  "decel_limit": 99,
+  "tsm_model": "None",
+  "model_id": 101,
+  "battery_size": 500,
+  "battery_type": "LTO_23Ah",
+  "is_config": true,
+  "machine_config": {},
+  "EndOfLifeSOH": 90,
+  "AvgAnnualAmbientTemp": 45,
+  "model_name": "CAT 793"
+}
+```
+
+#### Field Descriptions
+
+| Field | Type | Unit | Required | Description |
+|-------|------|------|----------|-------------|
+| `id` | number | - | Yes | Unique machine configuration identifier |
+| `type` | string | - | Yes | Machine type: `"diesel"` or `"electric"` |
+| `name` | string | - | Yes | User-defined name (unique, no commas) |
+| `dump_time` | number | minutes | Yes | Time to dump payload |
+| `fleet_type` | string | - | Yes | `"staffed"` or `"ahs"` (Autonomous Haul System) |
+| `accel_limit` | number | % | Yes | Acceleration limit (0-100) |
+| `decel_limit` | number | % | Yes | Deceleration limit (0-100) |
+| `tsm_model` | string | - | Yes | TSM model: `"None"`, `"777"`, `"785"`, `"789"`, `"793"`, `"794"`, `"797"`, `"798"` |
+| `model_id` | number/string | - | Yes | Reference to base machine model from database |
+| `battery_size` | number | kWh | Electric only | Battery capacity |
+| `battery_type` | string | - | Electric only | Battery chemistry: `"LTO_20Ah"`, `"LTO_23Ah"`, `"LFP_EVE_173"`, `"LFP_EVE_230"` |
+| `is_config` | boolean | - | No | Whether machine has custom configuration |
+| `machine_config` | object | - | No | Custom configuration parameters |
+| `EndOfLifeSOH` | number | % | Electric only | End of Life State of Health (0-100) |
+| `AvgAnnualAmbientTemp` | number | °C | Electric only | Average annual ambient temperature |
+| `model_name` | string | - | No | Display name of the base machine model |
+
+#### Battery Type Defaults
+
+| Battery Type | EndOfLifeSOH Default | AvgAnnualAmbientTemp Default |
+|--------------|---------------------|------------------------------|
+| LFP | 84.7% | 25°C |
+| LTO / LTO_20Ah / LTO_23Ah | 90% | 45°C |
+| EVE / NMC | 80% | 25°C |
+
+### Loader Machine Item (`machine_list.loaders`)
+
+```json
+{
+  "id": 1,
+  "type": "diesel",
+  "name": "Loader_Config_A",
+  "model_id": 201,
+  "loader": {},
+  "machine_config": {
+    "buckets": [
+      {
+        "Order": 1,
+        "selected": true,
+        "capacity": 10
+      }
+    ]
+  },
+  "geometry_name": "CAT_950_bucket_1",
+  "model_scale": 1.0,
+  "model_name": "CAT 950"
+}
+```
+
+#### Field Descriptions
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | number | Yes | Unique machine configuration identifier |
+| `type` | string | Yes | Machine type: `"diesel"` or `"electric"` |
+| `name` | string | Yes | User-defined name (unique, no commas) |
+| `model_id` | number/string | Yes | Reference to base machine model from database |
+| `loader` | object | Yes | Base loader machine specification from database |
+| `machine_config` | object | No | Custom configuration (buckets) |
+| `geometry_name` | string | No | Name of loader geometry for 3D visualization |
+| `model_scale` | number | No | Scale factor for 3D model |
+| `model_name` | string | No | Display name of the base machine model |
+
+---
+
+## Haulers
+
+Haulers represent truck fleet configurations assigned to routes.
+
+### Structure
+
+```json
+{
+  "id": 1,
+  "group_id": 1,
+  "key": "haulers",
+  "name": "Hauler 1",
+  "machine_id": 1,
+  "is_local_machine": null,
+  "geometry_name": "_default",
+  "model_scale": 1,
+  "type": "electric",
+  "number_of_haulers": 5,
+  "lane": 2,
+  "initial_position": 1,
+  "initial_level_pct": {
+    "type": "exact",
+    "value": 95
+  },
+  "battery_state_of_health": 90,
+  "battery_capacity": 500,
+  "initial_conditions": {
+    "route_id": 1,
+    "road_id": 1,
+    "node_id": 10,
+    "service_zone_id": 1,
+    "service_zone_spot_id": 1,
+    "load_zone_id": null,
+    "assigned_load_spots": []
+  },
+  "is_deactive": false
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Unit | Required | Description |
+|-------|------|------|----------|-------------|
+| `id` | number | - | Yes | Unique hauler identifier |
+| `group_id` | number | - | Yes | Group identifier (same as id) |
+| `key` | string | - | Yes | Always `"haulers"` |
+| `name` | string | - | Yes | Display name |
+| `machine_id` | number/string | - | Yes | Reference to machine in `machine_list.haulers` |
+| `is_local_machine` | boolean/null | - | No | Whether using locally stored machine |
+| `geometry_name` | string | - | No | 3D model geometry name |
+| `model_scale` | number | ratio | No | 3D model scaling factor |
+| `type` | string | - | No | `"electric"` or `"diesel"` (from machine) |
+| `number_of_haulers` | number/string | units | Yes | Fleet size (1-300), can be parameter reference |
+| `lane` | number | - | No | Lane assignment: `1`=haul, `2`=return |
+| `initial_position` | number | - | No | Start position: `1`=service zone, `2`=on route |
+| `initial_level_pct` | object | - | Yes | Initial fuel/SOC distribution |
+| `battery_state_of_health` | number/string | % | No | Battery SOH (0-100), parameter reference allowed |
+| `fuel_tank` | number | liters | Diesel only | Fuel tank capacity |
+| `battery_capacity` | number | kWh | Electric only | Battery capacity |
+| `initial_conditions` | object | - | Yes | Routing and location setup |
+| `is_deactive` | boolean | - | No | Whether hauler is disabled |
+
+### Initial Level Distribution Object (`initial_level_pct`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Distribution type: `"exact"`, `"uniform"`, `"normal"`, `"triangle"` |
+| `value` | number/string | Value for exact type or center value |
+| `lowerB` | number/string | Lower bound (uniform/normal/triangle) |
+| `upperB` | number/string | Upper bound (uniform/normal/triangle) |
+| `mean` | number/string | Mean value (normal distribution) |
+| `standard_deviation` | number/string | Standard deviation (normal distribution) |
+| `mode` | number/string | Mode value (triangle distribution) |
+
+### Initial Conditions Object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `route_id` | number/null | Route assignment |
+| `road_id` | number/null | Initial road segment |
+| `node_id` | number/null | Initial node on road |
+| `service_zone_id` | number/null | Service station zone ID |
+| `service_zone_spot_id` | number/null | Specific spot within service zone |
+| `load_zone_id` | number/null | Initial load zone (optional) |
+| `assigned_load_spots` | number[] | Array of load spot assignments |
+
+### Default Values
+
+| Field | Default |
+|-------|---------|
+| `number_of_haulers` | 1 |
+| `initial_position` | 1 (service zone) |
+| `lane` | 2 (return) |
+| `initial_level_pct.type` | "exact" |
+| `initial_level_pct.value` | 95 (from settings) |
+| `battery_state_of_health` | 90 (from settings) |
+| `model_scale` | 1 |
+| `geometry_name` | "_default" |
+| `is_deactive` | false |
+
+---
+
+## Loaders
+
+Loaders represent loading equipment assigned to load zones.
+
+### Structure
+
+```json
+{
+  "id": 1,
+  "name": "Loader 1",
+  "key": "loaders",
+  "machine_id": 1,
+  "configured": "CAT 390F (ID: 12)",
+  "used_for": "Truck Loading",
+  "fill_factor_pct": 100,
+  "initial_charge_fuel_levels_pct": 95,
+  "initial_conditions": {
+    "load_zone_id": 1,
+    "assigned_load_spots": [1, 2]
+  },
+  "is_deactive": false
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Unit | Required | Description |
+|-------|------|------|----------|-------------|
+| `id` | number | - | Yes | Unique loader identifier |
+| `name` | string | - | Yes | Display name (must be unique) |
+| `key` | string | - | Yes | Always `"loaders"` |
+| `machine_id` | number/string | - | Yes | Reference to machine in `machine_list.loaders` |
+| `configured` | string | - | Yes | Display string: `"{machineName} (ID: {modelId})"` |
+| `used_for` | string | - | Yes | `"Truck Loading"` or `"Load and Carry"` |
+| `fill_factor_pct` | number/string | % | Yes | Fill factor percentage (10-150) |
+| `initial_charge_fuel_levels_pct` | number/null | % | Conditional | Initial SOC/Fuel (0-100), null for non-hybrid |
+| `initial_conditions` | object | - | Yes | Zone and spot assignments |
+| `is_deactive` | boolean | - | No | Whether loader is disabled |
+
+### Initial Conditions Object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `load_zone_id` | number/null | Reference to load zone |
+| `assigned_load_spots` | number[]/null[] | Array of load spot IDs |
+
+### Default Values
+
+| Field | Default |
+|-------|---------|
+| `used_for` | "Truck Loading" |
+| `fill_factor_pct` | 100 |
+| `initial_charge_fuel_levels_pct` | 95 (hybrid only) |
+| `is_deactive` | false |
+
+### Usage Constraints
+
+- `"Load and Carry"`: Only works with zones having single load spot
+- `"Truck Loading"`: Works with production target-based methods
+- No duplicate spot assignments in same zone across loaders
+
+---
+
+## Operations - Material Schedules
+
+Material schedules define material movement plans and hauler assignment strategies.
+
+### Structure
+
+```json
+{
+  "material_schedules": {
+    "selected_material": 1,
+    "all_material_schedule": []
+  }
+}
+```
+
+### Material Schedule Item
+
+```json
+{
+  "id": 1,
+  "name": "Material Schedule 1",
+  "data": [],
+  "csv_data": [],
+  "hauler_assignment": {
+    "scheduling_method": "grouped_assignment",
+    "truck_schedule": {},
+    "truck_group": {}
+  },
+  "mixed_fleet_based_initial_assignment": false
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `selected_material` | number/string/null | Yes | ID or name of currently selected schedule |
+| `all_material_schedule` | array | Yes | Array of material schedule objects |
+
+### Material Schedule Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | number | Yes | Unique schedule identifier |
+| `name` | string | Yes | Display name |
+| `data` | array | Yes | Array of material movement items |
+| `csv_data` | array | No | Alternative data source from CSV import |
+| `hauler_assignment` | object | Yes | Hauler assignment strategy configuration |
+| `mixed_fleet_based_initial_assignment` | boolean | No | Whether to use mixed fleet assignments |
+
+### Hauler Assignment Object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scheduling_method` | string | Assignment method (see below) |
+| `truck_schedule` | object | Truck schedule mapping (truck_schedule_based only) |
+| `truck_group` | object | Truck group configuration (grouped_assignment only) |
+
+### Scheduling Methods
+
+| Method | Description |
+|--------|-------------|
+| `grouped_assignment` | Default, uses `num_of_hauler` field |
+| `production_target_based` | Production-based assignment, uses quantity as target |
+| `advanced_production_target_based` | Advanced variant with plan groups |
+| `truck_schedule_based` | Specific truck routing schedule |
+| `minestar_dispatching` | MineStar integration (restricted feature) |
+
+### Material Movement Item (data array)
+
+```json
+{
+  "id": 1,
+  "load_zone": "LZ-01",
+  "dump_zone": "DZ-01",
+  "route": "Route 1",
+  "auto_generate_route": false,
+  "material": "Ore",
+  "density": 2500,
+  "quantity": 10000,
+  "num_of_hauler": 5,
+  "start_time": 0,
+  "end_time": 480,
+  "plan_group": -1,
+  "assigned_machine_type": "hauler",
+  "hauler_group_id": null
+}
+```
+
+### Material Movement Item Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `id` | number/string | - | Row identifier |
+| `load_zone` | string/number | - | Name or ID of loading zone |
+| `dump_zone` | string/number | - | Name or ID of dumping zone |
+| `route` | string | - | Route name (optional if auto_generate_route) |
+| `auto_generate_route` | boolean | - | Auto-generate route from zones |
+| `material` | string | - | Material name/type |
+| `density` | number | kg/m³ | Material density |
+| `quantity` | number | tonnes | Material quantity or production target |
+| `num_of_hauler` | number | - | Number of haulers (grouped_assignment only) |
+| `start_time` | number | minutes | Start time |
+| `end_time` | number | minutes | End time |
+| `plan_group` | number | - | Plan group ID (-1 for default) |
+| `assigned_machine_type` | string | - | `"hauler"` or `"loader"` |
+| `hauler_group_id` | number/null | - | ID of specific hauler group |
+
+### Default Values
+
+| Field | Default |
+|-------|---------|
+| `scheduling_method` | "grouped_assignment" |
+| `mixed_fleet_based_initial_assignment` | false |
+| `assigned_machine_type` | "hauler" |
+| `plan_group` | -1 |
+
+---
+
+## File Format
+
+- **Extension**: `.json`
+- **Encoding**: UTF-8

@@ -8,6 +8,10 @@ function ExportButton({ site, onExportComplete }) {
   const [files, setFiles] = useState({});
   const eventSourceRef = useRef(null);
 
+  // Export file type selection
+  const [exportModel, setExportModel] = useState(true);
+  const [exportSimulation, setExportSimulation] = useState(true);
+
   useEffect(() => {
     // Check if there's an existing export in progress on mount
     checkInitialStatus();
@@ -103,6 +107,8 @@ function ExportButton({ site, onExportComplete }) {
             limit: 100000,
             sample_interval: 5,
           },
+          export_model: exportModel,
+          export_simulation: exportSimulation,
         }),
       });
 
@@ -172,6 +178,95 @@ function ExportButton({ site, onExportComplete }) {
             {site.site_short && (
               <span className="text-muted ms-2">({site.site_short})</span>
             )}
+          </div>
+        </div>
+
+        {/* Export Options */}
+        <div className="export-options">
+          <div className="export-options-header">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-2">
+              <path d="M4 22h14a2 2 0 0 0 2-2V7.5L14.5 2H6a2 2 0 0 0-2 2v4"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <path d="M3 15h6"></path>
+              <path d="M6 12v6"></path>
+            </svg>
+            <span className="export-options-title">Export Options</span>
+          </div>
+          <div className="export-options-grid">
+            <div
+              className={`export-option-item ${exportModel ? 'active' : ''} ${exporting || (exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (exporting) return;
+                // Prevent turning off if it's the only one enabled
+                if (exportModel && !exportSimulation) return;
+                setExportModel(!exportModel);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon model">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <path d="M12 18v-6"></path>
+                    <path d="M9 15h6"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Model</span>
+                  <span className="export-option-desc">Site structure & config</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportModel}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportSimulation) return;
+                    setExportModel(e.target.checked);
+                  }}
+                  disabled={exporting}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div
+              className={`export-option-item ${exportSimulation ? 'active' : ''} ${exporting || (exportSimulation && !exportModel) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (exporting) return;
+                // Prevent turning off if it's the only one enabled
+                if (exportSimulation && !exportModel) return;
+                setExportSimulation(!exportSimulation);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon simulation">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M3 3v18h18"></path>
+                    <path d="M18 17V9"></path>
+                    <path d="M13 17V5"></path>
+                    <path d="M8 17v-3"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Simulation</span>
+                  <span className="export-option-desc">DES inputs & events</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportSimulation}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportModel) return;
+                    setExportSimulation(e.target.checked);
+                  }}
+                  disabled={exporting}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
           </div>
         </div>
 

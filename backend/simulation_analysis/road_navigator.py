@@ -7,9 +7,12 @@ along roads with proper road switching when necessary.
 Business Rules:
 1. Hauler must move sequentially through nodes in road order
 2. Within each road, hauler visits nodes one by one without skipping
-3. Road switching only allowed at road endpoints (first or last node of a road)
+3. Road switching allowed at:
+   - Road endpoints (first or last node of a road)
+   - Shared nodes (nodes that exist on multiple roads)
 4. When current road doesn't contain next matched node, find a valid road that
    contains the sequential path the hauler has traveled
+5. Accuracy is highest priority - never skip nodes for performance
 """
 
 import math
@@ -68,6 +71,7 @@ class RoadNavigator:
         # Build road lookup structures
         self._node_to_roads: Dict[int, List[int]] = {}  # node_id -> list of road_ids containing it
         self._road_node_indices: Dict[int, Dict[int, int]] = {}  # road_id -> {node_id: index}
+        self._shared_nodes: Set[int] = set()  # Nodes that exist on multiple roads
         self._build_lookups()
 
         # Current navigation state
@@ -88,6 +92,11 @@ class RoadNavigator:
 
                 # Map node to index within road
                 self._road_node_indices[road_id][node_id] = idx
+
+        # Identify shared nodes (nodes that exist on multiple roads)
+        for node_id, road_ids in self._node_to_roads.items():
+            if len(road_ids) > 1:
+                self._shared_nodes.add(node_id)
 
     def reset(self) -> None:
         """Reset navigation state for new hauler session."""
@@ -158,6 +167,20 @@ class RoadNavigator:
         if not road_nodes:
             return False
         return node_id == road_nodes[0] or node_id == road_nodes[-1]
+
+    def _is_shared_node(self, node_id: int) -> bool:
+        """Check if node exists on multiple roads (shared node)."""
+        return node_id in self._shared_nodes
+
+    def _is_valid_switch_point(self, road_id: int, node_id: int) -> bool:
+        """
+        Check if node is a valid point to switch roads.
+
+        A node is valid for road switching if it's either:
+        - An endpoint of the current road
+        - A shared node (exists on multiple roads)
+        """
+        return self._is_road_endpoint(road_id, node_id) or self._is_shared_node(node_id)
 
     def _get_node_index_in_road(self, road_id: int, node_id: int) -> int:
         """Get index of node within road's node list. Returns -1 if not found."""
@@ -314,6 +337,21 @@ class RoadNavigator:
                     # Verify sequence is valid
                     if self._verify_switch_validity(road_id, last_index, target_index, direction, recent_nodes):
                         return (road_id, direction, target_index)
+                else:
+                    # Last node not on this road - check if any recent node is a shared node
+                    # that connects to this road (allows switch via shared node)
+                    for i in range(len(recent_nodes) - 1, -1, -1):
+                        node = recent_nodes[i]
+                        if node in road_nodes and self._is_shared_node(node):
+                            # Found a shared node that can serve as switch point
+                            switch_index = road_nodes.index(node)
+                            if target_index > switch_index:
+                                direction = 1
+                            elif target_index < switch_index:
+                                direction = -1
+                            else:
+                                continue
+                            return (road_id, direction, target_index)
             else:
                 # No history, any road containing target is valid
                 return (road_id, 1, target_index)
@@ -331,28 +369,33 @@ class RoadNavigator:
         """
         Verify that switching to this road maintains valid sequential traversal.
 
-        Checks that recent visited nodes match the road's node sequence.
+        For road switching to be valid:
+        1. The last visited node must exist on the new road
+        2. If multiple recent nodes exist on new road, they must be in correct order
+
+        Note: We relaxed the requirement from "all recent nodes must be on new road"
+        to "at least the last node must be on new road" to support roads that only
+        partially overlap (share some nodes but not all).
         """
         road_nodes = self._get_road_nodes(road_id)
         if not road_nodes:
             return False
 
-        # Check last few nodes in history match road sequence
-        check_count = min(3, len(recent_nodes))
-        if check_count == 0:
+        if not recent_nodes:
             return True
 
-        nodes_to_check = recent_nodes[-check_count:]
+        # At minimum, the last visited node should be on the new road
+        last_node = recent_nodes[-1]
+        if last_node not in road_nodes:
+            return False
 
-        # All checked nodes should be in this road
-        for node_id in nodes_to_check:
-            if node_id not in road_nodes:
-                return False
-
-        # Check they appear in correct order
-        indices = [road_nodes.index(n) for n in nodes_to_check if n in road_nodes]
-        if len(indices) < 2:
+        # Check which recent nodes are on this road and verify their order
+        nodes_on_road = [n for n in recent_nodes if n in road_nodes]
+        if len(nodes_on_road) < 2:
             return True
+
+        # Check they appear in correct order (monotonic indices)
+        indices = [road_nodes.index(n) for n in nodes_on_road]
 
         # Indices should be monotonic in the direction of travel
         if direction == 1:
@@ -504,8 +547,10 @@ class RoadNavigator:
         Handle navigation when target is NOT on current road.
 
         This implements the road switching logic:
-        1. Find a road that contains both recent visited nodes AND target node
-        2. Validate sequential traversal is maintained
+        1. Find a road that contains recent visited nodes OR a shared node
+        2. Calculate intermediate nodes:
+           a. From current position to switch point (on current road)
+           b. From switch point to target (on new road)
         3. Switch to new road
         """
         # Get recent visited nodes for validation
@@ -520,14 +565,57 @@ class RoadNavigator:
 
         new_road_id, direction, target_index = switch_result
         new_road_nodes = self._get_road_nodes(new_road_id)
+        current_road_nodes = self._get_road_nodes(self.state.current_road_id)
 
-        # Calculate intermediate nodes from last visited node on new road
+        # Calculate intermediate nodes
         intermediate = []
+
+        # Find the switch point (shared node) between current and new road
+        switch_node_id = None
         if recent_nodes and recent_nodes[-1] in new_road_nodes:
-            last_index = new_road_nodes.index(recent_nodes[-1])
-            intermediate = self._get_intermediate_nodes(
-                new_road_id, last_index, target_index, direction
+            # Last visited node is on new road - direct switch
+            switch_node_id = recent_nodes[-1]
+        else:
+            # Find a shared node that connects current road to new road
+            for node_id in current_road_nodes:
+                if node_id in new_road_nodes and self._is_shared_node(node_id):
+                    current_idx = self._get_node_index_in_road(self.state.current_road_id, node_id)
+                    # Prefer shared node ahead of current position (in travel direction)
+                    if self.state.direction == 1 and current_idx >= self.state.current_node_index:
+                        switch_node_id = node_id
+                        break
+                    elif self.state.direction == -1 and current_idx <= self.state.current_node_index:
+                        switch_node_id = node_id
+                        break
+            # If no shared node in travel direction, try any shared node
+            if switch_node_id is None:
+                for node_id in current_road_nodes:
+                    if node_id in new_road_nodes and self._is_shared_node(node_id):
+                        switch_node_id = node_id
+                        break
+
+        if switch_node_id:
+            # Calculate intermediate nodes on CURRENT road to reach switch point
+            switch_idx_current = self._get_node_index_in_road(self.state.current_road_id, switch_node_id)
+            if switch_idx_current >= 0 and switch_idx_current != self.state.current_node_index:
+                dir_to_switch = 1 if switch_idx_current > self.state.current_node_index else -1
+                intermediate_current = self._get_intermediate_nodes(
+                    self.state.current_road_id,
+                    self.state.current_node_index,
+                    switch_idx_current,
+                    dir_to_switch
+                )
+                intermediate.extend(intermediate_current)
+                # Add the switch node itself if it's not already in intermediate
+                if switch_node_id not in intermediate:
+                    intermediate.append(switch_node_id)
+
+            # Calculate intermediate nodes on NEW road from switch point to target
+            switch_idx_new = new_road_nodes.index(switch_node_id)
+            intermediate_new = self._get_intermediate_nodes(
+                new_road_id, switch_idx_new, target_index, direction
             )
+            intermediate.extend(intermediate_new)
 
         # Update state for road switch
         old_road_id = self.state.current_road_id
@@ -566,8 +654,9 @@ class RoadNavigator:
         Fallback handling when no direct road switch is valid.
 
         Tries multiple strategies:
-        1. Search for road that connects current road endpoint to target
-        2. Allow direct jump if at road endpoint
+        1. Switch at valid switch points (endpoints or shared nodes)
+        2. Search for road that connects via shared nodes
+        3. Use BFS to find multi-road path
         """
         current_road_nodes = self._get_road_nodes(self.state.current_road_id)
         if not current_road_nodes:
@@ -575,10 +664,10 @@ class RoadNavigator:
 
         current_node_id = current_road_nodes[self.state.current_node_index]
 
-        # Check if current node is an endpoint
-        is_at_endpoint = self._is_road_endpoint(self.state.current_road_id, current_node_id)
+        # Check if current node is a valid switch point (endpoint OR shared node)
+        is_valid_switch = self._is_valid_switch_point(self.state.current_road_id, current_node_id)
 
-        if is_at_endpoint:
+        if is_valid_switch:
             # At endpoint - allowed to switch to any road containing target
             candidate_roads = self._node_to_roads.get(target_node_id, [])
 
