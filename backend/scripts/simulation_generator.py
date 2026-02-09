@@ -24,7 +24,7 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
-from collections import deque
+from collections import deque, defaultdict
 import math
 
 # Add webapp directory to path for imports
@@ -50,6 +50,12 @@ except ImportError:
 
 from backend.core.db_config import DB_CONFIG, OUTPUT_PATH, EXAMPLE_JSON_PATH
 from backend.simulation_analysis import GPSToEventsConverter
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
 
 
 # =============================================================================
@@ -754,6 +760,243 @@ def create_roads_from_trajectories(
     return all_nodes, roads
 
 
+def split_roads_at_intersections(
+    roads: List[Dict],
+) -> Tuple[List[Dict], Dict[int, List[int]]]:
+    """
+    Split roads at intersection and overlap points.
+
+    Rules:
+    - Roads can only share nodes at start or end points
+    - If roads share nodes in the middle, split them at those points
+    - Deduplicate shared segments
+
+    Args:
+        roads: List of road dictionaries with 'id' and 'nodes' keys
+
+    Returns:
+        Tuple of:
+        - List of new road segments (with updated IDs and names)
+        - Mapping from original road ID to list of new segment IDs
+    """
+    if not roads:
+        return [], {}
+
+    print(f"    Splitting roads at intersections ({len(roads)} roads)...")
+
+    # Step 1: Build node usage map
+    # node_id -> list of (road_id, position_index, is_endpoint)
+    node_usage: Dict[int, List[Tuple[int, int, bool]]] = {}
+
+    for road in roads:
+        road_id = road["id"]
+        nodes = road["nodes"]
+        if not nodes:
+            continue
+
+        for idx, node_id in enumerate(nodes):
+            is_endpoint = (idx == 0 or idx == len(nodes) - 1)
+
+            if node_id not in node_usage:
+                node_usage[node_id] = []
+            node_usage[node_id].append((road_id, idx, is_endpoint))
+
+    # Step 2: Identify critical nodes (split points)
+    # A node is critical if:
+    # - It's an endpoint of any road, OR
+    # - It appears in more than one road
+    critical_nodes: Set[int] = set()
+
+    for node_id, usages in node_usage.items():
+        # Check if endpoint of any road
+        if any(is_endpoint for _, _, is_endpoint in usages):
+            critical_nodes.add(node_id)
+        # Check if used by multiple roads
+        elif len(set(road_id for road_id, _, _ in usages)) > 1:
+            critical_nodes.add(node_id)
+
+    print(f"      Found {len(critical_nodes)} critical nodes (split points)")
+
+    # Step 3: Split each road at critical nodes
+    # raw_segments: list of (original_road_id, node_list_tuple)
+    raw_segments: List[Tuple[int, Tuple[int, ...]]] = []
+
+    for road in roads:
+        road_id = road["id"]
+        nodes = road["nodes"]
+
+        if len(nodes) < 2:
+            continue
+
+        # Find split indices (positions of critical nodes in this road's middle)
+        split_indices = [0]  # Always start from beginning
+        for idx in range(1, len(nodes) - 1):  # Skip first and last (they're always splits)
+            if nodes[idx] in critical_nodes:
+                split_indices.append(idx)
+        split_indices.append(len(nodes) - 1)  # Always end at last node
+
+        # Remove duplicates and sort
+        split_indices = sorted(set(split_indices))
+
+        # Create segments between consecutive split points
+        for i in range(len(split_indices) - 1):
+            start_idx = split_indices[i]
+            end_idx = split_indices[i + 1]
+
+            segment_nodes = tuple(nodes[start_idx:end_idx + 1])
+            if len(segment_nodes) >= 2:
+                raw_segments.append((road_id, segment_nodes))
+
+    print(f"      Created {len(raw_segments)} raw segments")
+
+    # Step 4: Deduplicate segments
+    # Group segments by their node sequence (to find shared segments)
+    # Key: node_tuple (or reversed), Value: list of original road IDs
+    segment_to_roads: Dict[Tuple[int, ...], Set[int]] = {}
+
+    for original_road_id, segment_nodes in raw_segments:
+        # Normalize segment direction (use smaller first node as canonical form)
+        # This ensures [1,2,3] and [3,2,1] are treated as same segment
+        if segment_nodes[0] > segment_nodes[-1]:
+            canonical_nodes = tuple(reversed(segment_nodes))
+        else:
+            canonical_nodes = segment_nodes
+
+        if canonical_nodes not in segment_to_roads:
+            segment_to_roads[canonical_nodes] = set()
+        segment_to_roads[canonical_nodes].add(original_road_id)
+
+    # Step 5: Create final segments with proper IDs and names
+    new_roads: List[Dict] = []
+    new_road_id = 1
+
+    # Map: canonical_nodes -> new_road_id (for building road composition)
+    canonical_to_new_id: Dict[Tuple[int, ...], int] = {}
+
+    for canonical_nodes, original_road_ids in segment_to_roads.items():
+        is_shared = len(original_road_ids) > 1
+
+        # Generate name
+        if is_shared:
+            name = f"Road_{new_road_id}_Shared"
+        else:
+            name = f"Road_{new_road_id}"
+
+        new_road = {
+            "id": new_road_id,
+            "name": name,
+            "nodes": list(canonical_nodes),
+            "is_generated": False,
+            "ways_num": 2,
+            "lanes_num": 1,
+            "banking": "",
+            "lane_width": "",
+            "speed_limit": "",
+            "rolling_resistance": "",
+            "traction_coefficient": "",
+            "offset": 0,
+            # Metadata for tracking
+            "_original_roads": sorted(original_road_ids),
+            "_is_shared": is_shared,
+        }
+        new_roads.append(new_road)
+        canonical_to_new_id[canonical_nodes] = new_road_id
+        new_road_id += 1
+
+    # Step 6: Build road composition mapping
+    # original_road_id -> list of new segment IDs in order
+    road_composition: Dict[int, List[int]] = {}
+
+    for road in roads:
+        original_road_id = road["id"]
+        nodes = road["nodes"]
+
+        if len(nodes) < 2:
+            road_composition[original_road_id] = []
+            continue
+
+        # Find split indices again
+        split_indices = [0]
+        for idx in range(1, len(nodes) - 1):
+            if nodes[idx] in critical_nodes:
+                split_indices.append(idx)
+        split_indices.append(len(nodes) - 1)
+        split_indices = sorted(set(split_indices))
+
+        # Build ordered list of segment IDs
+        segment_ids = []
+        for i in range(len(split_indices) - 1):
+            start_idx = split_indices[i]
+            end_idx = split_indices[i + 1]
+
+            segment_nodes = tuple(nodes[start_idx:end_idx + 1])
+            if len(segment_nodes) < 2:
+                continue
+
+            # Find canonical form
+            if segment_nodes[0] > segment_nodes[-1]:
+                canonical_nodes = tuple(reversed(segment_nodes))
+            else:
+                canonical_nodes = segment_nodes
+
+            if canonical_nodes in canonical_to_new_id:
+                segment_ids.append(canonical_to_new_id[canonical_nodes])
+
+        road_composition[original_road_id] = segment_ids
+
+    # Count shared segments
+    shared_count = sum(1 for r in new_roads if r.get("_is_shared", False))
+    print(f"      Final: {len(new_roads)} segments ({shared_count} shared)")
+
+    return new_roads, road_composition
+
+
+def update_routes_with_split_roads(
+    routes: List[Dict],
+    road_composition: Dict[int, List[int]],
+) -> List[Dict]:
+    """
+    Update route definitions to use split road segments.
+
+    Args:
+        routes: List of route dictionaries with 'haul' and 'return' keys
+        road_composition: Mapping from original road ID to list of new segment IDs
+
+    Returns:
+        Updated routes with expanded road references
+    """
+    if not routes:
+        return routes
+
+    updated_routes = []
+    for route in routes:
+        new_route = route.copy()
+
+        # Update haul path
+        if "haul" in route and route["haul"]:
+            new_haul = []
+            for road_id in route["haul"]:
+                if road_id in road_composition:
+                    new_haul.extend(road_composition[road_id])
+                else:
+                    new_haul.append(road_id)
+            new_route["haul"] = new_haul
+
+        # Update return path
+        if "return" in route and route["return"]:
+            new_return = []
+            for road_id in route["return"]:
+                if road_id in road_composition:
+                    new_return.extend(road_composition[road_id])
+                else:
+                    new_return.append(road_id)
+            new_route["return"] = new_return
+
+        updated_routes.append(new_route)
+
+    return updated_routes
+
+
 def detect_road_network(
     all_points: List[Tuple],
     grid_size: float = 5.0,
@@ -1356,19 +1599,40 @@ def create_routes(
 
             # Determine haul path: from load_zone exit to dump_zone entry
             haul_roads = []
+            haul_path_found = False
             if lz_outroad_ids and dz_inroad_ids:
                 # If both zones connect to the same road, that's the haul road
                 if lz_outroad_ids[0] == dz_inroad_ids[0]:
                     haul_roads = [lz_outroad_ids[0]]
+                    haul_path_found = True
                 else:
                     # Try to find path from load_zone exit node to dump_zone entry node
                     if lz_outnode_ids and dz_innode_ids:
                         path = find_path(lz_outnode_ids[0], dz_innode_ids[0])
                         if path:
                             haul_roads = path
+                            haul_path_found = True
                         else:
-                            # Fallback: use both roads if no path found
-                            haul_roads = lz_outroad_ids + [r for r in dz_inroad_ids if r not in lz_outroad_ids]
+                            # Fallback: try to find connecting path between roads
+                            lz_road = road_lookup.get(lz_outroad_ids[0])
+                            dz_road = road_lookup.get(dz_inroad_ids[0])
+                            if lz_road and dz_road:
+                                # Try all endpoint combinations
+                                lz_endpoints = [lz_road["nodes"][0], lz_road["nodes"][-1]]
+                                dz_endpoints = [dz_road["nodes"][0], dz_road["nodes"][-1]]
+                                for lz_ep in lz_endpoints:
+                                    for dz_ep in dz_endpoints:
+                                        connecting_path = find_path(lz_ep, dz_ep)
+                                        if connecting_path:
+                                            # Build full path: lz_outroad + connecting + dz_inroad
+                                            haul_roads = lz_outroad_ids + connecting_path + [r for r in dz_inroad_ids if r not in lz_outroad_ids and r not in connecting_path]
+                                            haul_path_found = True
+                                            break
+                                    if haul_path_found:
+                                        break
+                            if not haul_path_found:
+                                # Last fallback: just use lz_outroad (partial path)
+                                haul_roads = lz_outroad_ids
                     else:
                         haul_roads = lz_outroad_ids
             elif lz_outroad_ids:
@@ -1376,29 +1640,76 @@ def create_routes(
 
             # Determine return path: from dump_zone exit to load_zone entry
             return_roads = []
+            return_path_found = False
             if dz_outroad_ids and lz_inroad_ids:
                 # If both zones connect to the same road, that's the return road
                 if dz_outroad_ids[0] == lz_inroad_ids[0]:
                     return_roads = [dz_outroad_ids[0]]
+                    return_path_found = True
                 else:
                     # Try to find path from dump_zone exit node to load_zone entry node
                     if dz_outnode_ids and lz_innode_ids:
                         path = find_path(dz_outnode_ids[0], lz_innode_ids[0])
                         if path:
                             return_roads = path
+                            return_path_found = True
                         else:
-                            # Fallback: use both roads if no path found
-                            return_roads = dz_outroad_ids + [r for r in lz_inroad_ids if r not in dz_outroad_ids]
+                            # Fallback: try to find connecting path between roads
+                            dz_road = road_lookup.get(dz_outroad_ids[0])
+                            lz_road = road_lookup.get(lz_inroad_ids[0])
+                            if dz_road and lz_road:
+                                # Try all endpoint combinations
+                                dz_endpoints = [dz_road["nodes"][0], dz_road["nodes"][-1]]
+                                lz_endpoints = [lz_road["nodes"][0], lz_road["nodes"][-1]]
+                                for dz_ep in dz_endpoints:
+                                    for lz_ep in lz_endpoints:
+                                        connecting_path = find_path(dz_ep, lz_ep)
+                                        if connecting_path:
+                                            # Build full path: dz_outroad + connecting + lz_inroad
+                                            return_roads = dz_outroad_ids + connecting_path + [r for r in lz_inroad_ids if r not in dz_outroad_ids and r not in connecting_path]
+                                            return_path_found = True
+                                            break
+                                    if return_path_found:
+                                        break
+                            if not return_path_found:
+                                # Last fallback: just use dz_outroad (partial path)
+                                return_roads = dz_outroad_ids
                     else:
                         return_roads = dz_outroad_ids
             elif dz_outroad_ids:
                 return_roads = dz_outroad_ids
 
-            # If no specific roads found, use all roads as fallback
-            if not haul_roads:
-                haul_roads = [r["id"] for r in roads]
-            if not return_roads:
-                return_roads = list(reversed([r["id"] for r in roads]))
+            # Skip routes with no valid paths
+            if not haul_roads and not return_roads:
+                print(f"    Warning: No path found for route {lz_name} to {dz_name}, skipping")
+                continue
+
+            # Validate route connectivity
+            def validate_path_connectivity(path: List[int], path_name: str) -> bool:
+                """Check if consecutive roads in path share a common endpoint."""
+                if len(path) <= 1:
+                    return True
+                for i in range(len(path) - 1):
+                    road_a = road_lookup.get(path[i])
+                    road_b = road_lookup.get(path[i + 1])
+                    if not road_a or not road_b:
+                        continue
+                    # Get endpoints of both roads
+                    a_endpoints = {road_a["nodes"][0], road_a["nodes"][-1]}
+                    b_endpoints = {road_b["nodes"][0], road_b["nodes"][-1]}
+                    # Check if they share any endpoint
+                    if not a_endpoints.intersection(b_endpoints):
+                        print(f"    Warning: {path_name} roads {path[i]} and {path[i+1]} do not share a common node")
+                        return False
+                return True
+
+            haul_valid = validate_path_connectivity(haul_roads, f"Route '{lz_name} to {dz_name}' haul")
+            return_valid = validate_path_connectivity(return_roads, f"Route '{lz_name} to {dz_name}' return")
+
+            # Only add route if both paths are valid (or empty)
+            if not haul_valid or not return_valid:
+                print(f"    Warning: Route {lz_name} to {dz_name} has invalid paths, skipping")
+                continue
 
             route = {
                 "id": route_id,
@@ -1412,6 +1723,998 @@ def create_routes(
             route_id += 1
 
     return routes
+
+
+def get_path_entry_exit_nodes(
+    path: List[int],
+    roads: List[Dict],
+    start_node_hint: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Determine the entry and exit nodes of a path (sequence of roads).
+
+    For a valid path, consecutive roads must share a common endpoint.
+    This function traces through the path to find:
+    - Entry node: The starting node where we enter the first road
+    - Exit node: The ending node where we leave the last road
+
+    Args:
+        path: List of road IDs forming the path
+        roads: List of road dictionaries
+        start_node_hint: Optional hint for which node to start from (for single road paths)
+
+    Returns:
+        Tuple of (entry_node_id, exit_node_id), or (None, None) if path is invalid
+    """
+    if not path:
+        return None, None
+
+    road_lookup = {r["id"]: r for r in roads}
+
+    if len(path) == 1:
+        # Single road - use hint if provided, otherwise return both endpoints
+        road = road_lookup.get(path[0])
+        if not road or len(road["nodes"]) < 2:
+            return None, None
+
+        start_node = road["nodes"][0]
+        end_node = road["nodes"][-1]
+
+        # If hint is provided and matches one endpoint, use it to determine direction
+        if start_node_hint is not None:
+            if start_node_hint == start_node:
+                return start_node, end_node
+            elif start_node_hint == end_node:
+                return end_node, start_node
+
+        # Default: first node is entry, last node is exit
+        return start_node, end_node
+
+    # For multiple roads, trace through to find entry/exit
+    # Start by determining which endpoint of first road connects to second road
+    first_road = road_lookup.get(path[0])
+    second_road = road_lookup.get(path[1])
+
+    if not first_road or not second_road:
+        return None, None
+
+    first_endpoints = {first_road["nodes"][0], first_road["nodes"][-1]}
+    second_endpoints = {second_road["nodes"][0], second_road["nodes"][-1]}
+
+    shared = first_endpoints.intersection(second_endpoints)
+    if not shared:
+        return None, None
+
+    # The shared node is where first road exits
+    shared_node = shared.pop()
+    # Entry node is the other endpoint of first road
+    entry_node = first_road["nodes"][-1] if first_road["nodes"][0] == shared_node else first_road["nodes"][0]
+
+    # Now trace through to find exit node
+    current_node = shared_node
+    for i in range(1, len(path)):
+        road = road_lookup.get(path[i])
+        if not road:
+            return entry_node, None
+
+        # Determine which direction we traverse this road
+        if road["nodes"][0] == current_node:
+            # Traverse forward
+            current_node = road["nodes"][-1]
+        elif road["nodes"][-1] == current_node:
+            # Traverse backward
+            current_node = road["nodes"][0]
+        else:
+            # Discontinuity - road doesn't connect
+            return entry_node, None
+
+    return entry_node, current_node
+
+
+def update_zone_settings_for_routes(
+    routes: List[Dict],
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    roads: List[Dict],
+) -> None:
+    """
+    Update zone innode_ids and outnode_ids based on actual route paths.
+
+    This ensures zone entry/exit nodes match the route definitions to avoid
+    discontinuity errors during validation.
+
+    For each route:
+    - Load zone outnode_ids should include the entry node of first haul road
+    - Dump zone innode_ids should include the exit node of last haul road
+    - Dump zone outnode_ids should include the entry node of first return road
+    - Load zone innode_ids should include the exit node of last return road
+
+    Args:
+        routes: List of route dictionaries
+        load_zones: List of load zone dictionaries (will be modified in place)
+        dump_zones: List of dump zone dictionaries (will be modified in place)
+        roads: List of road dictionaries
+    """
+    if not routes or not roads:
+        return
+
+    # Build zone lookups
+    lz_lookup = {z["id"]: z for z in load_zones}
+    dz_lookup = {z["id"]: z for z in dump_zones}
+
+    for route in routes:
+        lz_id = route.get("load_zone")
+        dz_id = route.get("dump_zone")
+        haul_path = route.get("haul", [])
+        return_path = route.get("return", [])
+
+        lz = lz_lookup.get(lz_id)
+        dz = dz_lookup.get(dz_id)
+
+        if not lz or not dz:
+            continue
+
+        # Ensure settings exist
+        if "settings" not in lz:
+            lz["settings"] = {}
+        if "settings" not in dz:
+            dz["settings"] = {}
+
+        # Get existing zone node hints for single road cases
+        lz_outnode_hint = lz["settings"].get("outnode_ids", [None])[0]
+        dz_outnode_hint = dz["settings"].get("outnode_ids", [None])[0]
+
+        # Process haul path: load zone -> dump zone
+        if haul_path:
+            haul_entry, haul_exit = get_path_entry_exit_nodes(
+                haul_path, roads, start_node_hint=lz_outnode_hint
+            )
+
+            if haul_entry is not None:
+                # Update load zone outnode_ids
+                outnode_ids = lz["settings"].get("outnode_ids", [])
+                if haul_entry not in outnode_ids:
+                    outnode_ids.append(haul_entry)
+                lz["settings"]["outnode_ids"] = outnode_ids
+
+            if haul_exit is not None:
+                # Update dump zone innode_ids
+                innode_ids = dz["settings"].get("innode_ids", [])
+                if haul_exit not in innode_ids:
+                    innode_ids.append(haul_exit)
+                dz["settings"]["innode_ids"] = innode_ids
+
+        # Process return path: dump zone -> load zone
+        if return_path:
+            return_entry, return_exit = get_path_entry_exit_nodes(
+                return_path, roads, start_node_hint=dz_outnode_hint
+            )
+
+            if return_entry is not None:
+                # Update dump zone outnode_ids
+                outnode_ids = dz["settings"].get("outnode_ids", [])
+                if return_entry not in outnode_ids:
+                    outnode_ids.append(return_entry)
+                dz["settings"]["outnode_ids"] = outnode_ids
+
+            if return_exit is not None:
+                # Update load zone innode_ids
+                innode_ids = lz["settings"].get("innode_ids", [])
+                if return_exit not in innode_ids:
+                    innode_ids.append(return_exit)
+                lz["settings"]["innode_ids"] = innode_ids
+
+
+def analyze_hauler_trips_from_telemetry(
+    telemetry_data: List[Tuple],
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    coordinates_in_meters: bool = False,
+    payload_threshold: float = 50.0,
+) -> Dict[int, List[Dict]]:
+    """
+    Analyze telemetry data to extract actual hauler trips (load zone -> dump zone).
+
+    Detects complete cycles by tracking payload transitions:
+    - LOAD: payload transitions from empty (<50%) to loaded (>50%)
+    - DUMP: payload transitions from loaded (>50%) to empty (<50%)
+
+    Args:
+        telemetry_data: List of telemetry tuples
+        load_zones: List of load zone dictionaries with detected_location
+        dump_zones: List of dump zone dictionaries with detected_location
+        coordinates_in_meters: If True, coordinates are in meters; otherwise millimeters
+        payload_threshold: Payload percentage threshold (default 50%)
+
+    Returns:
+        Dictionary mapping machine_id -> list of trips
+        Each trip: {"load_zone_id": int, "dump_zone_id": int, "load_zone_name": str, "dump_zone_name": str}
+    """
+    if not telemetry_data:
+        return {}
+
+    import math
+
+    # Build zone lookups with locations
+    def get_zone_location(zone):
+        loc = zone.get("detected_location") or zone.get("settings", {}).get("detected_location")
+        if loc:
+            return loc.get("x", 0), loc.get("y", 0)
+        return None
+
+    lz_locations = []
+    for z in load_zones:
+        loc = get_zone_location(z)
+        if loc:
+            lz_locations.append({
+                "id": z["id"],
+                "name": z.get("name", f"Load zone {z['id']}"),
+                "x": loc[0],
+                "y": loc[1],
+            })
+
+    dz_locations = []
+    for z in dump_zones:
+        loc = get_zone_location(z)
+        if loc:
+            dz_locations.append({
+                "id": z["id"],
+                "name": z.get("name", f"Dump zone {z['id']}"),
+                "x": loc[0],
+                "y": loc[1],
+            })
+
+    def find_nearest_zone(x, y, zones):
+        """Find nearest zone to (x, y) coordinates."""
+        if not zones:
+            return None
+        best = None
+        best_dist = float("inf")
+        for z in zones:
+            dx = x - z["x"]
+            dy = y - z["y"]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < best_dist:
+                best_dist = dist
+                best = z
+        return best if best_dist < 500 else None  # Max 500m from zone center
+
+    # Group telemetry by machine_id and sort by time
+    machine_data = {}
+    for row in telemetry_data:
+        machine_id = row[1] if len(row) > 1 else None
+        if machine_id is None:
+            continue
+
+        if machine_id not in machine_data:
+            machine_data[machine_id] = []
+
+        # Extract data: (timestamp, x, y, payload)
+        timestamp = row[2] if len(row) > 2 else 0
+        if coordinates_in_meters:
+            x = float(row[4]) if len(row) > 4 and row[4] else 0
+            y = float(row[5]) if len(row) > 5 and row[5] else 0
+        else:
+            x = row[4] / 1000.0 if len(row) > 4 and row[4] else 0
+            y = row[5] / 1000.0 if len(row) > 5 and row[5] else 0
+        payload = row[13] if len(row) > 13 and row[13] is not None else 0
+
+        machine_data[machine_id].append({
+            "timestamp": timestamp,
+            "x": x,
+            "y": y,
+            "payload": payload,
+        })
+
+    # Analyze trips for each machine
+    trips_by_machine = {}
+    for machine_id, data_points in machine_data.items():
+        # Sort by timestamp
+        data_points.sort(key=lambda p: p["timestamp"])
+
+        trips = []
+        prev_loaded = None
+        current_load_zone = None
+
+        for point in data_points:
+            payload = point["payload"]
+            is_loaded = payload >= payload_threshold
+
+            if prev_loaded is not None:
+                # Detect LOAD transition (empty -> loaded)
+                if not prev_loaded and is_loaded:
+                    zone = find_nearest_zone(point["x"], point["y"], lz_locations)
+                    if zone:
+                        current_load_zone = zone
+
+                # Detect DUMP transition (loaded -> empty)
+                elif prev_loaded and not is_loaded:
+                    zone = find_nearest_zone(point["x"], point["y"], dz_locations)
+                    if zone and current_load_zone:
+                        # Complete trip detected
+                        trips.append({
+                            "load_zone_id": current_load_zone["id"],
+                            "load_zone_name": current_load_zone["name"],
+                            "dump_zone_id": zone["id"],
+                            "dump_zone_name": zone["name"],
+                        })
+                    current_load_zone = None
+
+            prev_loaded = is_loaded
+
+        if trips:
+            trips_by_machine[machine_id] = trips
+
+    return trips_by_machine
+
+
+def create_material_schedule_from_trips(
+    trips_by_machine: Dict[int, List[Dict]],
+    machines: Dict[int, Dict] = None,
+    default_density: float = 1960.19,
+    default_material: str = "Ore",
+) -> List[Dict]:
+    """
+    Create material schedule data from analyzed hauler trips.
+
+    Each unique combination of (machine_id, load_zone, dump_zone) creates
+    one material schedule item with num_of_hauler = 1 (since each hauler group
+    contains exactly 1 hauler).
+
+    Args:
+        trips_by_machine: Dictionary from analyze_hauler_trips_from_telemetry
+        machines: Optional machine info dictionary
+        default_density: Default material density
+        default_material: Default material name
+
+    Returns:
+        List of material schedule data items
+    """
+    if not trips_by_machine:
+        return []
+
+    # Collect unique (machine_id, lz_name, dz_name) combinations
+    unique_routes = set()
+    for machine_id, trips in trips_by_machine.items():
+        for trip in trips:
+            key = (machine_id, trip["load_zone_name"], trip["dump_zone_name"])
+            unique_routes.add(key)
+
+    # Build material schedule items - one per unique (hauler, route) combination
+    material_data = []
+    hauler_group_id = 1
+    for idx, (machine_id, lz_name, dz_name) in enumerate(sorted(unique_routes), start=1):
+        item = {
+            "id": idx,
+            "load_zone": lz_name,
+            "dump_zone": dz_name,
+            "route": "",
+            "auto_generate_route": True,
+            "material": default_material,
+            "density": default_density,
+            "num_of_hauler": 1,
+            "assigned_machine_type": "Hauler",
+            "multiple_routes": False,
+            "hauler_group_id": hauler_group_id,
+        }
+        material_data.append(item)
+        hauler_group_id += 1
+
+    return material_data
+
+
+def create_material_schedule_data(
+    routes: List[Dict],
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    haulers: List[Dict] = None,
+    telemetry_data: List[Tuple] = None,
+    coordinates_in_meters: bool = False,
+    default_density: float = 1960.19,
+    default_material: str = "Ore",
+) -> List[Dict]:
+    """
+    Create material schedule data based on actual telemetry trips or routes.
+
+    If telemetry_data is provided, analyzes actual hauler trips to determine
+    which haulers traveled between which zones. Otherwise, falls back to
+    generating items from routes.
+
+    Args:
+        routes: List of route dictionaries with load_zone and dump_zone references
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
+        haulers: Optional list of hauler dictionaries
+        telemetry_data: Optional telemetry data for actual trip analysis
+        coordinates_in_meters: Whether telemetry coordinates are in meters
+        default_density: Default material density in kg/m³
+        default_material: Default material name
+
+    Returns:
+        List of material schedule data items
+    """
+    # Try to analyze actual trips from telemetry data first
+    if telemetry_data and load_zones and dump_zones:
+        trips_by_machine = analyze_hauler_trips_from_telemetry(
+            telemetry_data, load_zones, dump_zones, coordinates_in_meters
+        )
+        if trips_by_machine:
+            return create_material_schedule_from_trips(
+                trips_by_machine,
+                default_density=default_density,
+                default_material=default_material,
+            )
+
+    # Fallback: generate from routes
+    if not routes:
+        return []
+
+    # Build zone name lookups
+    lz_lookup = {z["id"]: z.get("name", f"Load zone {z['id']}") for z in load_zones}
+    dz_lookup = {z["id"]: z.get("name", f"Dump zone {z['id']}") for z in dump_zones}
+
+    # Count haulers per route if haulers provided
+    haulers_per_route = {}
+    if haulers:
+        for hauler in haulers:
+            route_id = hauler.get("initial_conditions", {}).get("route_id")
+            if route_id is not None:
+                haulers_per_route[route_id] = haulers_per_route.get(route_id, 0) + hauler.get("number_of_haulers", 1)
+
+    # Default haulers per route if no hauler info available
+    total_haulers = sum(haulers_per_route.values()) if haulers_per_route else len(routes) * 4
+    default_haulers = max(1, total_haulers // len(routes)) if routes else 4
+
+    material_data = []
+    for idx, route in enumerate(routes, start=1):
+        lz_id = route.get("load_zone")
+        dz_id = route.get("dump_zone")
+
+        lz_name = lz_lookup.get(lz_id, f"Load zone {lz_id}")
+        dz_name = dz_lookup.get(dz_id, f"Dump zone {dz_id}")
+        route_name = route.get("name", "")
+
+        # Get hauler count for this route
+        num_haulers = haulers_per_route.get(route.get("id"), default_haulers)
+
+        item = {
+            "id": idx,
+            "load_zone": lz_name,
+            "dump_zone": dz_name,
+            "route": route_name,
+            "auto_generate_route": True,
+            "material": default_material,
+            "density": default_density,
+            "num_of_hauler": num_haulers,
+            "assigned_machine_type": "Hauler",
+            "multiple_routes": False,
+            "hauler_group_id": 1,
+        }
+        material_data.append(item)
+
+    return material_data
+
+
+def create_operations_structure(
+    routes: List[Dict],
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    haulers: List[Dict] = None,
+    telemetry_data: List[Tuple] = None,
+    coordinates_in_meters: bool = False,
+    schedule_name: str = "Material Schedule 1",
+    scheduling_method: str = "grouped_assignment",
+) -> Dict:
+    """
+    Create the complete operations structure with material schedules.
+
+    Args:
+        routes: List of route dictionaries
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
+        haulers: Optional list of hauler dictionaries
+        telemetry_data: Optional telemetry data for actual trip analysis
+        coordinates_in_meters: Whether telemetry coordinates are in meters
+        schedule_name: Name for the material schedule
+        scheduling_method: Scheduling method (grouped_assignment, production_target_based, etc.)
+
+    Returns:
+        Operations dictionary with material_schedules structure
+    """
+    material_data = create_material_schedule_data(
+        routes, load_zones, dump_zones, haulers,
+        telemetry_data=telemetry_data,
+        coordinates_in_meters=coordinates_in_meters,
+    )
+
+    return {
+        "material_schedules": {
+            "selected_material": 1,
+            "all_material_schedule": [
+                {
+                    "id": 1,
+                    "name": schedule_name,
+                    "hauler_assignment": {"scheduling_method": scheduling_method},
+                    "mixed_fleet_based_initial_assignment": False,
+                    "data": material_data,
+                }
+            ],
+        },
+        "operational_delays": {
+            "haulers": [],
+            "trolleys": [],
+            "load_zones": [],
+            "dump_zones": [],
+        },
+    }
+
+
+def export_route_excel(
+    nodes: List[Dict],
+    roads: List[Dict],
+    load_zones: List[Dict],
+    dump_zones: List[Dict],
+    routes: List[Dict],
+    output_path: str,
+) -> Optional[str]:
+    """
+    Export route data to Excel file following Route_Template format.
+
+    The Route_Data sheet contains node coordinates for each route with
+    the following columns:
+    - Easting (m): X coordinate
+    - Northing (m): Y coordinate
+    - Elevation (m): Z coordinate
+    - RouteIndex: Route identifier (road_id)
+    - Segment: "haul" or "return"
+    - Load Zone: Load zone name
+    - Dump Zone: Dump zone name
+    - Rolling Resistance (%): Optional
+    - Speed Limit (kph): Optional
+    - Trolley: Optional
+    - Banking (%): Optional
+    - Curvature (1/m): Optional
+    - Lane Width (m): Optional
+    - Traction Coefficient: Optional
+
+    Args:
+        nodes: List of node dictionaries with coords
+        roads: List of road dictionaries with node IDs
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
+        routes: List of route dictionaries connecting zones
+        output_path: Output file path for Excel file
+
+    Returns:
+        Path to generated Excel file, or None if pandas not available
+    """
+    if not PANDAS_AVAILABLE:
+        print("    Warning: pandas not available, skipping Excel export")
+        return None
+
+    if not nodes or not roads:
+        print("    Warning: No nodes or roads to export")
+        return None
+
+    # Build node lookup
+    node_lookup = {n["id"]: n for n in nodes}
+
+    # Build zone name lookups
+    load_zone_lookup = {z["id"]: z.get("name", f"Load zone {z['id']}") for z in (load_zones or [])}
+    dump_zone_lookup = {z["id"]: z.get("name", f"Dump zone {z['id']}") for z in (dump_zones or [])}
+
+    # Build road lookup
+    road_lookup = {r["id"]: r for r in roads}
+
+    # Prepare data rows
+    rows = []
+
+    if routes:
+        # Export based on routes (with Load Zone / Dump Zone info)
+        for route in routes:
+            route_id = route["id"]
+            load_zone_id = route.get("load_zone")
+            dump_zone_id = route.get("dump_zone")
+            load_zone_name = load_zone_lookup.get(load_zone_id, "")
+            dump_zone_name = dump_zone_lookup.get(dump_zone_id, "")
+
+            # Export haul roads
+            haul_road_ids = route.get("haul", [])
+            for road_id in haul_road_ids:
+                road = road_lookup.get(road_id)
+                if not road:
+                    continue
+                for node_id in road.get("nodes", []):
+                    node = node_lookup.get(node_id)
+                    if not node:
+                        continue
+                    coords = node.get("coords", [0, 0, 0])
+                    rows.append({
+                        "Easting (m)": round(coords[0], 3),
+                        "Northing (m)": round(coords[1], 3),
+                        "Elevation (m)": round(coords[2], 3),
+                        "RouteIndex": route_id,
+                        "Segment": "haul",
+                        "Load Zone": load_zone_name,
+                        "Dump Zone": dump_zone_name,
+                        "Rolling Resistance (%)": node.get("rolling_resistance", ""),
+                        "Speed Limit (kph)": node.get("speed_limit", ""),
+                        "Trolley": "",
+                        "Banking (%)": node.get("banking", ""),
+                        "Curvature (1/m)": node.get("curvature", ""),
+                        "Lane Width (m)": node.get("lane_width", ""),
+                        "Traction Coefficient": node.get("traction", ""),
+                    })
+
+            # Export return roads
+            return_road_ids = route.get("return", [])
+            for road_id in return_road_ids:
+                road = road_lookup.get(road_id)
+                if not road:
+                    continue
+                for node_id in road.get("nodes", []):
+                    node = node_lookup.get(node_id)
+                    if not node:
+                        continue
+                    coords = node.get("coords", [0, 0, 0])
+                    rows.append({
+                        "Easting (m)": round(coords[0], 3),
+                        "Northing (m)": round(coords[1], 3),
+                        "Elevation (m)": round(coords[2], 3),
+                        "RouteIndex": route_id,
+                        "Segment": "return",
+                        "Load Zone": load_zone_name,
+                        "Dump Zone": dump_zone_name,
+                        "Rolling Resistance (%)": node.get("rolling_resistance", ""),
+                        "Speed Limit (kph)": node.get("speed_limit", ""),
+                        "Trolley": "",
+                        "Banking (%)": node.get("banking", ""),
+                        "Curvature (1/m)": node.get("curvature", ""),
+                        "Lane Width (m)": node.get("lane_width", ""),
+                        "Traction Coefficient": node.get("traction", ""),
+                    })
+    else:
+        # Fallback: Export roads without route info (Segment = "road")
+        for road in roads:
+            road_id = road["id"]
+            for node_id in road.get("nodes", []):
+                node = node_lookup.get(node_id)
+                if not node:
+                    continue
+                coords = node.get("coords", [0, 0, 0])
+                rows.append({
+                    "Easting (m)": round(coords[0], 3),
+                    "Northing (m)": round(coords[1], 3),
+                    "Elevation (m)": round(coords[2], 3),
+                    "RouteIndex": road_id,
+                    "Segment": "road",
+                    "Load Zone": "",
+                    "Dump Zone": "",
+                    "Rolling Resistance (%)": node.get("rolling_resistance", ""),
+                    "Speed Limit (kph)": node.get("speed_limit", ""),
+                    "Trolley": "",
+                    "Banking (%)": node.get("banking", ""),
+                    "Curvature (1/m)": node.get("curvature", ""),
+                    "Lane Width (m)": node.get("lane_width", ""),
+                    "Traction Coefficient": node.get("traction", ""),
+                })
+
+    if not rows:
+        print("    Warning: No route data to export")
+        return None
+
+    # Create DataFrame with column order matching template
+    columns = [
+        "Easting (m)",
+        "Northing (m)",
+        "Elevation (m)",
+        "RouteIndex",
+        "Segment",
+        "Rolling Resistance (%)",
+        "Speed Limit (kph)",
+        "Load Zone",
+        "Dump Zone",
+        "Trolley",
+        "Banking (%)",
+        "Curvature (1/m)",
+        "Lane Width (m)",
+        "Traction Coefficient",
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+
+    # Replace empty strings with NaN for cleaner Excel output
+    df = df.replace("", pd.NA)
+
+    # Write to Excel with Route_Data sheet
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Route_Data", index=False)
+        return output_path
+    except Exception as e:
+        print(f"    Error writing Excel file: {e}")
+        return None
+
+
+def find_connected_components(roads: List[Dict]) -> List[Set[int]]:
+    """
+    Find connected components in road network using BFS.
+
+    Args:
+        roads: List of road dictionaries with 'nodes' field
+
+    Returns:
+        List of sets, each set contains node_ids belonging to same component
+    """
+    # Build adjacency list (undirected graph)
+    graph = defaultdict(set)
+    for road in roads:
+        road_nodes = road.get("nodes", [])
+        for i in range(len(road_nodes) - 1):
+            graph[road_nodes[i]].add(road_nodes[i + 1])
+            graph[road_nodes[i + 1]].add(road_nodes[i])
+
+    # BFS to find connected components
+    all_node_ids = set(graph.keys())
+    visited = set()
+    components = []
+
+    for node_id in all_node_ids:
+        if node_id not in visited:
+            component = set()
+            queue = deque([node_id])
+            while queue:
+                current = queue.popleft()
+                if current in visited:
+                    continue
+                visited.add(current)
+                component.add(current)
+                for neighbor in graph[current]:
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+            components.append(component)
+
+    return components
+
+
+def find_center_nodes_for_haulers(
+    nodes: List[Dict],
+    roads: List[Dict],
+    machine_first_positions: Dict[int, Tuple[float, float, float]],
+) -> Dict[int, int]:
+    """
+    Find center node for each hauler based on connected components.
+    Haulers in the same network component share the same center node.
+
+    Args:
+        nodes: List of node dictionaries
+        roads: List of road dictionaries
+        machine_first_positions: Dict mapping machine_id to (x, y, z) coordinates
+
+    Returns:
+        Dict mapping machine_id to center_node_id
+    """
+    if not nodes or not roads or not machine_first_positions:
+        return {}
+
+    # Find connected components
+    components = find_connected_components(roads)
+    if not components:
+        return {}
+
+    # Build node_id -> coords lookup
+    node_coords = {n["id"]: (n["coords"][0], n["coords"][1]) for n in nodes}
+
+    def find_nearest_node_in_set(x: float, y: float, node_set: Set[int]) -> Optional[int]:
+        """Find nearest node to (x, y) within a specific node set."""
+        min_dist = float('inf')
+        nearest = None
+        for nid in node_set:
+            if nid not in node_coords:
+                continue
+            nx, ny = node_coords[nid]
+            dist = (x - nx) ** 2 + (y - ny) ** 2
+            if dist < min_dist:
+                min_dist = dist
+                nearest = nid
+        return nearest
+
+    # Group haulers by component
+    component_haulers = defaultdict(list)  # component_idx -> [(machine_id, nearest_node_id)]
+
+    for machine_id, (x, y, z) in machine_first_positions.items():
+        nearest_node = None
+        component_idx = None
+        min_dist = float('inf')
+
+        # Find which component this hauler belongs to
+        for idx, component in enumerate(components):
+            node_id = find_nearest_node_in_set(x, y, component)
+            if node_id:
+                nx, ny = node_coords[node_id]
+                dist = (x - nx) ** 2 + (y - ny) ** 2
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_node = node_id
+                    component_idx = idx
+
+        if component_idx is not None:
+            component_haulers[component_idx].append((machine_id, nearest_node))
+
+    # Find center node for each component that has haulers
+    def find_component_center(component: Set[int], hauler_nodes: List[int]) -> Optional[int]:
+        """Find node in component closest to centroid of hauler positions."""
+        hauler_coords_list = [node_coords[nid] for nid in hauler_nodes if nid in node_coords]
+        if not hauler_coords_list:
+            return None
+
+        # Calculate centroid of hauler positions
+        center_x = sum(c[0] for c in hauler_coords_list) / len(hauler_coords_list)
+        center_y = sum(c[1] for c in hauler_coords_list) / len(hauler_coords_list)
+
+        # Find actual node in component closest to centroid
+        min_dist = float('inf')
+        center_node = None
+        for nid in component:
+            if nid not in node_coords:
+                continue
+            nx, ny = node_coords[nid]
+            dist = (center_x - nx) ** 2 + (center_y - ny) ** 2
+            if dist < min_dist:
+                min_dist = dist
+                center_node = nid
+
+        return center_node
+
+    # Build result: machine_id -> center_node_id
+    result = {}
+    for comp_idx, haulers in component_haulers.items():
+        component = components[comp_idx]
+        hauler_nodes = [node_id for _, node_id in haulers]
+        center_node = find_component_center(component, hauler_nodes)
+
+        for machine_id, _ in haulers:
+            result[machine_id] = center_node
+
+    return result
+
+
+def create_service_stations_for_haulers(
+    center_nodes: Dict[int, int],
+    nodes: List[Dict],
+    roads: List[Dict],
+) -> Tuple[List[Dict], List[Dict], Dict[int, Tuple[int, int]]]:
+    """
+    Create service stations and fuel zones at center nodes for hauler initial positions.
+
+    Args:
+        center_nodes: Dict mapping machine_id to center_node_id
+        nodes: List of node dictionaries
+        roads: List of road dictionaries
+
+    Returns:
+        Tuple of:
+        - List of service station dictionaries
+        - List of charger (fuel zone) dictionaries
+        - Dict mapping machine_id to (service_zone_id, service_zone_spot_id)
+    """
+    if not center_nodes:
+        return [], [], {}
+
+    # Get unique center nodes
+    unique_centers = set(center_nodes.values())
+    node_coords = {n["id"]: n["coords"] for n in nodes}
+
+    # Build node_to_roads mapping
+    node_to_roads = defaultdict(list)
+    for road in roads:
+        for nid in road.get("nodes", []):
+            node_to_roads[nid].append(road["id"])
+
+    service_stations = []
+    chargers = []
+    node_to_service = {}  # center_node_id -> service_zone_id
+
+    for idx, center_node_id in enumerate(sorted(unique_centers), start=1):
+        if center_node_id is None:
+            continue
+
+        coords = node_coords.get(center_node_id, [0, 0, 0])
+        road_ids = node_to_roads.get(center_node_id, [])
+
+        # Use first road for in/out if available
+        inroad_ids = [road_ids[0]] if road_ids else []
+        outroad_ids = [road_ids[0]] if road_ids else []
+
+        # Create service station
+        service_station = {
+            "id": idx,
+            "name": f"Service {idx}",
+            "is_generated": True,
+            "is_deactive": False,
+            "is_show_service": True,
+            "settings": {
+                "n_spots": 2,  # Always 2 spots per service station
+                "roadlength": 100,
+                "speed_limit": "",
+                "rolling_resistance": "",
+                "flip": False,
+                "dtheta": 0,
+                "n_entrances": 1,
+                "queing": False,
+                "reverse_speed_limit": "",
+                "width": 50,
+                "angular_spread": 80,
+                "create_uturn_road": False,
+                "clearance_radius": 80,
+                "access_distance": 40,
+                "zonetype": "servicestandard",
+                "inroad_ids": inroad_ids,
+                "outroad_ids": outroad_ids,
+                "innode_ids": [center_node_id],
+                "outnode_ids": [center_node_id],
+            },
+        }
+        service_stations.append(service_station)
+
+        # Create charger (fuel zone) at same location
+        charger = {
+            "id": idx,
+            "name": f"Fuel Zone {idx}",
+            "type": "diesel",
+            "output_power": "",
+            "connect_time": "",
+            "disconnect_time": "",
+            "efficiency": "",
+            "ramup_time": "",
+            "cable_efficiency": "",
+            "is_generated": True,
+            "is_deactive": False,
+            "power_factor": "",
+            "power_factor_lagging": "",
+            "fuel_rate": "",
+            "settings": {
+                "n_spots": 6,
+                "roadlength": 100,
+                "speed_limit": "",
+                "rolling_resistance": "",
+                "flip": False,
+                "dtheta": 0,
+                "n_entrances": 1,
+                "queing": False,
+                "reverse_speed_limit": "",
+                "width": 50,
+                "angular_spread": 80,
+                "create_uturn_road": False,
+                "clearance_radius": 80,
+                "access_distance": 40,
+                "zonetype": "amtinspectionbays",
+                "additional_battery": 0,
+                "inroad_ids": inroad_ids,
+                "outroad_ids": outroad_ids,
+                "innode_ids": [center_node_id],
+                "outnode_ids": [center_node_id],
+            },
+        }
+        chargers.append(charger)
+
+        node_to_service[center_node_id] = idx
+
+    # Build machine_id -> (service_zone_id, spot_id) mapping
+    # Distribute haulers evenly between spot 1 and spot 2
+    service_spot_counters = defaultdict(int)  # service_id -> current count (for alternating)
+    hauler_to_service = {}
+
+    for machine_id, center_node_id in center_nodes.items():
+        if center_node_id is None:
+            continue
+        service_id = node_to_service.get(center_node_id)
+        if service_id:
+            # Alternate between spot 1 and 2
+            service_spot_counters[service_id] += 1
+            spot_id = 1 if service_spot_counters[service_id] % 2 == 1 else 2
+            hauler_to_service[machine_id] = (service_id, spot_id)
+
+    return service_stations, chargers, hauler_to_service
 
 
 def create_model(
@@ -1481,6 +2784,10 @@ def create_model(
             default_loader = deep_copy_dict(loaders_in_list[0])
             machine_list_loaders.append(default_loader)
             default_loader_machine_list_id = default_loader.get("id", 1)
+
+    # Create routes and update zone settings to ensure connectivity
+    routes = create_routes(load_zones, dump_zones, roads, nodes)
+    update_zone_settings_for_routes(routes, load_zones, dump_zones, roads)
 
     model = {
         "version": version,
@@ -1623,7 +2930,7 @@ def create_model(
         "economic_settings": {},
         "zone_defaults": {
             "trolley": {
-                "type": 0,
+                "type": "DET",
                 "stop_propel": True,
                 "queue_at_entry": False,
                 "speed_reduction": False,
@@ -1694,13 +3001,20 @@ def create_model(
         "service_stations": [],
         "dump_zones": dump_zones,
         "load_zones": load_zones,
-        "routes": create_routes(load_zones, dump_zones, roads, nodes),
+        "routes": routes,
         "haulers": [],
         "loaders": [],
         "simulates": [],
         "esses": [],
         "batteries": [],
         "crushers": [],
+        "operations": create_operations_structure(
+            routes, load_zones, dump_zones,
+            telemetry_data=telemetry_data,
+            coordinates_in_meters=coordinates_in_meters,
+            schedule_name="Material Schedule 1",
+            scheduling_method="grouped_assignment"
+        ),
         "cameraPosition": {"x": 0, "y": 1000, "z": 0},
         "controlTarget": {"x": 0, "y": 0, "z": 0},
     }
@@ -1747,17 +3061,27 @@ def create_model(
                         z = row[6] / 1000.0
                     machine_first_positions[mid] = (x, y, z)
 
-        def find_nearest_node(x: float, y: float) -> Optional[int]:
-            """Find nearest node to given coordinates."""
-            min_dist = float('inf')
-            nearest_node_id = None
-            for node in nodes:
-                nx, ny = node["coords"][0], node["coords"][1]
-                dist = (x - nx) ** 2 + (y - ny) ** 2
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_node_id = node["id"]
-            return nearest_node_id
+        # Find center nodes for each hauler based on connected road components
+        # Filter positions to only include machines that will be processed
+        filtered_positions = {}
+        for machine_id, machine_info in machines.items():
+            if machines_with_events is not None and machine_id not in machines_with_events:
+                continue
+            type_name = machine_info.get("type_name", "Unknown")
+            model_name = extract_machine_model(type_name)
+            if model_name_to_machine_list_id.get(model_name) is not None:
+                if machine_id in machine_first_positions:
+                    filtered_positions[machine_id] = machine_first_positions[machine_id]
+
+        # Find center nodes and create service stations and fuel zones
+        center_nodes = find_center_nodes_for_haulers(nodes, roads, filtered_positions)
+        service_stations, chargers, hauler_to_service = create_service_stations_for_haulers(
+            center_nodes, nodes, roads
+        )
+
+        # Add service stations and chargers to model
+        model["service_stations"] = service_stations
+        model["chargers"] = chargers
 
         hauler_id = 1
         for machine_id, machine_info in machines.items():
@@ -1773,61 +3097,75 @@ def create_model(
             if machine_list_id is None:
                 continue
 
-            # Determine initial position from telemetry data
-            init_node_id = None
-            init_road_id = None
-            init_route_id = first_route_id
-
-            first_pos = machine_first_positions.get(machine_id)
-            if first_pos and nodes:
-                x, y, z = first_pos
-                init_node_id = find_nearest_node(x, y)
-
-                # Find road containing this node
-                if init_node_id and init_node_id in node_to_roads:
-                    road_ids = node_to_roads[init_node_id]
-                    if road_ids:
-                        init_road_id = road_ids[0]
-
-                        # Find route using this road
-                        if init_road_id in road_to_routes:
-                            route_ids = road_to_routes[init_road_id]
-                            if route_ids:
-                                init_route_id = route_ids[0]
+            # Get service zone assignment for this hauler
+            service_info = hauler_to_service.get(machine_id)
 
             # Get machine spec to determine type
             spec_data = get_machine_spec_from_list(type_name, machines_list) if machines_list else None
             machine_type = spec_data.get("type", "diesel") if spec_data else "diesel"
             is_electric = machine_type == "electric"
 
-            hauler = {
-                "id": hauler_id,
-                "group_id": hauler_id,
-                "key": "haulers",
-                "name": f"Hauler {hauler_id}",
-                "machine_id": machine_list_id,
-                "is_local_machine": None,
-                "geometry_name": "_default",
-                "model_scale": 1,
-                "type": machine_type,
-                "number_of_haulers": 1,
-                "lane": 2,
-                "initial_position": 1,  # 1 = on route
-                "initial_level_pct": {
-                    "type": "exact",
-                    "value": 95
-                },
-                "initial_conditions": {
-                    "route_id": init_route_id,
-                    "road_id": init_road_id,
-                    "node_id": init_node_id,
-                    "service_zone_id": None,
-                    "service_zone_spot_id": None,
-                    "load_zone_id": None,
-                    "assigned_load_spots": []
-                },
-                "is_deactive": False
-            }
+            # Use initial_position = 2 (service zone) if service zone is assigned
+            if service_info:
+                service_zone_id, service_zone_spot_id = service_info
+                hauler = {
+                    "id": hauler_id,
+                    "group_id": hauler_id,
+                    "key": "haulers",
+                    "name": f"Hauler {hauler_id}",
+                    "machine_id": machine_list_id,
+                    "is_local_machine": None,
+                    "geometry_name": "_default",
+                    "model_scale": 1,
+                    "type": machine_type,
+                    "number_of_haulers": 1,
+                    "lane": 2,
+                    "initial_position": 2,  # 2 = service zone
+                    "initial_level_pct": {
+                        "type": "exact",
+                        "value": 95
+                    },
+                    "initial_conditions": {
+                        "route_id": None,
+                        "road_id": None,
+                        "node_id": None,
+                        "service_zone_id": service_zone_id,
+                        "service_zone_spot_id": service_zone_spot_id,
+                        "load_zone_id": None,
+                        "assigned_load_spots": []
+                    },
+                    "is_deactive": False
+                }
+            else:
+                # Fallback to route-based initial position
+                hauler = {
+                    "id": hauler_id,
+                    "group_id": hauler_id,
+                    "key": "haulers",
+                    "name": f"Hauler {hauler_id}",
+                    "machine_id": machine_list_id,
+                    "is_local_machine": None,
+                    "geometry_name": "_default",
+                    "model_scale": 1,
+                    "type": machine_type,
+                    "number_of_haulers": 1,
+                    "lane": 2,
+                    "initial_position": 1,  # 1 = on route
+                    "initial_level_pct": {
+                        "type": "exact",
+                        "value": 95
+                    },
+                    "initial_conditions": {
+                        "route_id": first_route_id,
+                        "road_id": None,
+                        "node_id": None,
+                        "service_zone_id": None,
+                        "service_zone_spot_id": None,
+                        "load_zone_id": None,
+                        "assigned_load_spots": []
+                    },
+                    "is_deactive": False
+                }
 
             # Add type-specific fields
             if is_electric:
@@ -1866,7 +3204,7 @@ def create_model(
                 "machine_id": default_loader_machine_list_id,
                 "configured": f"{loader_model_name} (ID: {loader_model_id})",
                 "used_for": "Truck Loading",
-                "fill_factor_pct": 100,
+                "fill_factor_pct": 1.0,
                 "initial_charge_fuel_levels_pct": 95,
                 "initial_conditions": {
                     "load_zone_id": lz_id,
@@ -2071,6 +3409,112 @@ def _create_default_loader_spec() -> Dict:
     }
 
 
+def _create_des_operations(
+    des_routes: List[Dict],
+    des_load_zones: List[Dict],
+    des_dump_zones: List[Dict],
+    haulers: List[Dict] = None,
+    model_load_zones: List[Dict] = None,
+    model_dump_zones: List[Dict] = None,
+    telemetry_data: List[Tuple] = None,
+    coordinates_in_meters: bool = False,
+) -> Dict:
+    """
+    Create operations structure for DES inputs.
+
+    If telemetry_data is provided, analyzes actual hauler trips to determine
+    which haulers traveled between which zones.
+
+    Args:
+        des_routes: List of DES route dictionaries (with start_zone/end_zone format)
+        des_load_zones: List of DES load zone dictionaries
+        des_dump_zones: List of DES dump zone dictionaries
+        haulers: Optional list of hauler dictionaries
+        model_load_zones: Model load zones with detected_location (for trip analysis)
+        model_dump_zones: Model dump zones with detected_location (for trip analysis)
+        telemetry_data: Optional telemetry data for actual trip analysis
+        coordinates_in_meters: Whether telemetry coordinates are in meters
+
+    Returns:
+        Operations dictionary with material_schedules
+    """
+    # Try to analyze actual trips from telemetry data first
+    material_data = []
+
+    if telemetry_data and model_load_zones and model_dump_zones:
+        trips_by_machine = analyze_hauler_trips_from_telemetry(
+            telemetry_data, model_load_zones, model_dump_zones, coordinates_in_meters
+        )
+        if trips_by_machine:
+            material_data = create_material_schedule_from_trips(trips_by_machine)
+
+    # Fallback: generate from DES routes
+    if not material_data:
+        # Build zone name lookups
+        lz_lookup = {z["id"]: z.get("name", f"Load zone {z['id']}") for z in des_load_zones}
+        dz_lookup = {z["id"]: z.get("name", f"Dump zone {z['id']}") for z in des_dump_zones}
+
+        # Count haulers per route if available
+        haulers_per_route = {}
+        if haulers:
+            for hauler in haulers:
+                route_id = hauler.get("initial_conditions", {}).get("route_id")
+                if route_id is not None:
+                    haulers_per_route[route_id] = haulers_per_route.get(route_id, 0) + hauler.get("number_of_haulers", 1)
+
+        # Default haulers per route
+        total_haulers = sum(haulers_per_route.values()) if haulers_per_route else len(des_routes) * 4
+        default_haulers = max(1, total_haulers // len(des_routes)) if des_routes else 4
+
+        for idx, route in enumerate(des_routes, start=1):
+            # Extract zone IDs from DES route format
+            lz_id = route.get("start_zone", {}).get("id")
+            dz_id = route.get("end_zone", {}).get("id")
+
+            lz_name = lz_lookup.get(lz_id, f"Load zone {lz_id}")
+            dz_name = dz_lookup.get(dz_id, f"Dump zone {dz_id}")
+            route_name = route.get("name", "")
+
+            # Get hauler count for this route
+            num_haulers = haulers_per_route.get(route.get("id"), default_haulers)
+
+            item = {
+                "id": idx,
+                "load_zone": lz_name,
+                "dump_zone": dz_name,
+                "route": route_name,
+                "auto_generate_route": True,
+                "material": "Ore",
+                "density": 1960.19,
+                "num_of_hauler": num_haulers,
+                "assigned_machine_type": "Hauler",
+                "multiple_routes": False,
+                "hauler_group_id": 1,
+            }
+            material_data.append(item)
+
+    return {
+        "material_schedules": {
+            "selected_material": 1,
+            "all_material_schedule": [
+                {
+                    "id": 1,
+                    "name": "Material Schedule 1",
+                    "hauler_assignment": {"scheduling_method": "grouped_assignment"},
+                    "mixed_fleet_based_initial_assignment": False,
+                    "data": material_data,
+                }
+            ],
+        },
+        "operational_delays": {
+            "haulers": [],
+            "trolleys": [],
+            "load_zones": [],
+            "dump_zones": [],
+        },
+    }
+
+
 def create_des_inputs(
     model: Dict,
     machines: Dict[int, Dict],
@@ -2078,6 +3522,8 @@ def create_des_inputs(
     sim_time: int = 480,
     machines_with_events: Optional[Set[int]] = None,
     machine_templates: Optional[Dict[str, Any]] = None,
+    telemetry_data: Optional[List[Tuple]] = None,
+    coordinates_in_meters: bool = False,
 ) -> Dict:
     """
     Create DES Inputs structure from model and machine data.
@@ -2089,6 +3535,8 @@ def create_des_inputs(
         sim_time: Simulation time in minutes
         machines_with_events: Set of machine IDs that have events data
         machine_templates: Machine templates loaded from JSON file
+        telemetry_data: Optional telemetry data for actual trip analysis
+        coordinates_in_meters: Whether telemetry coordinates are in meters
 
     Returns:
         DES Inputs dictionary
@@ -2689,7 +4137,7 @@ def create_des_inputs(
         },
         "zone_defaults": {
             "trolley": {
-                "type": 0,
+                "type": "DET",
                 "stop_propel": True,
                 "queue_at_entry": False,
                 "speed_reduction": False,
@@ -2771,20 +4219,13 @@ def create_des_inputs(
         "esses": {},
         "electrical_distributions": [],
         "haulers_assignment": [],
-        "operations": {
-            "material_schedules": {
-                "selected_material": 1,
-                "all_material_schedule": [
-                    {
-                        "id": 1,
-                        "name": "Default_MMP",
-                        "hauler_assignment": {"scheduling_method": "production_target_based"},
-                        "data": [],
-                    }
-                ],
-            },
-            "operational_delays": {"haulers": [], "trolleys": [], "load_zones": [], "dump_zones": []},
-        },
+        "operations": _create_des_operations(
+            des_routes, des_load_zones, des_dump_zones, haulers,
+            model_load_zones=load_zones,
+            model_dump_zones=dump_zones,
+            telemetry_data=telemetry_data,
+            coordinates_in_meters=coordinates_in_meters,
+        ),
         "override_parameters": {},
         "intersections": [],
     }
@@ -2817,6 +4258,7 @@ def process_site(
     output_base_name: Optional[str] = None,
     export_model: bool = True,
     export_simulation: bool = True,
+    export_routes_excel: bool = False,
 ) -> Dict[str, str]:
     """
     Process site data and generate all output files.
@@ -2846,6 +4288,7 @@ def process_site(
                          If not provided, uses site_name.
         export_model: If True, generate model.json file.
         export_simulation: If True, generate des_inputs.json.gz and ledger.json.gz files.
+        export_routes_excel: If True, generate routes.xlsx file (Route_Template format).
 
     Returns:
         Dictionary with paths to generated files
@@ -2918,11 +4361,16 @@ def process_site(
         min_segment_distance=15.0,
         coordinates_in_meters=coordinates_in_meters,
     )
-    
+
     if not nodes or not roads:
         print("  Error: Could not generate road network")
         return {}
-    
+
+    # Split roads at intersections and overlaps
+    # This ensures roads only share nodes at endpoints
+    roads, road_composition = split_roads_at_intersections(roads)
+    print(f"    After splitting: {len(roads)} road segments")
+
     # Detect zones
     print("  [3/5] Detecting load/dump zones...")
     if precomputed_zones is not None:
@@ -3008,7 +4456,9 @@ def process_site(
         # Generate DES Inputs - only include machines that have events
         print("  [5/5] Generating DES inputs...")
         des_inputs = create_des_inputs(
-            model, machines, site_name, sim_time, machines_with_events, machine_templates
+            model, machines, site_name, sim_time, machines_with_events, machine_templates,
+            telemetry_data=telemetry_data,
+            coordinates_in_meters=coordinates_in_meters,
         )
     else:
         print("  [4/5] Skipping simulation events (export_simulation=False)")
@@ -3030,6 +4480,17 @@ def process_site(
             json.dump(model, f, indent=2)
         result["model"] = model_path
         print(f"    - Model: {safe_name}_model.json ({len(nodes)} nodes, {len(roads)} roads)", flush=True)
+
+    # Export route data to Excel (Route_Template format) - requires model data
+    if export_routes_excel:
+        routes = model.get("routes", [])
+        route_excel_path = os.path.join(output_dir, f"{safe_name}_routes.xlsx")
+        excel_result = export_route_excel(
+            nodes, roads, load_zones, dump_zones, routes, route_excel_path
+        )
+        if excel_result:
+            result["routes_excel"] = excel_result
+            print(f"    - Routes Excel: {safe_name}_routes.xlsx ({len(routes)} routes)", flush=True)
 
     # Save simulation files (if export_simulation is True)
     if export_simulation:

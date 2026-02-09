@@ -11,6 +11,7 @@ function ExportButton({ site, onExportComplete }) {
   // Export file type selection
   const [exportModel, setExportModel] = useState(true);
   const [exportSimulation, setExportSimulation] = useState(true);
+  const [exportRoutesExcel, setExportRoutesExcel] = useState(false);
 
   useEffect(() => {
     // Check if there's an existing export in progress on mount
@@ -109,6 +110,7 @@ function ExportButton({ site, onExportComplete }) {
           },
           export_model: exportModel,
           export_simulation: exportSimulation,
+          export_routes_excel: exportRoutesExcel,
         }),
       });
 
@@ -194,11 +196,11 @@ function ExportButton({ site, onExportComplete }) {
           </div>
           <div className="export-options-grid">
             <div
-              className={`export-option-item ${exportModel ? 'active' : ''} ${exporting || (exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              className={`export-option-item ${exportModel ? 'active' : ''} ${exporting || (exportModel && !exportSimulation && !exportRoutesExcel) ? 'disabled' : ''}`}
               onClick={() => {
                 if (exporting) return;
                 // Prevent turning off if it's the only one enabled
-                if (exportModel && !exportSimulation) return;
+                if (exportModel && !exportSimulation && !exportRoutesExcel) return;
                 setExportModel(!exportModel);
               }}
             >
@@ -222,7 +224,7 @@ function ExportButton({ site, onExportComplete }) {
                   checked={exportModel}
                   onChange={(e) => {
                     // Prevent turning off if it's the only one enabled
-                    if (!e.target.checked && !exportSimulation) return;
+                    if (!e.target.checked && !exportSimulation && !exportRoutesExcel) return;
                     setExportModel(e.target.checked);
                   }}
                   disabled={exporting}
@@ -231,11 +233,11 @@ function ExportButton({ site, onExportComplete }) {
               </label>
             </div>
             <div
-              className={`export-option-item ${exportSimulation ? 'active' : ''} ${exporting || (exportSimulation && !exportModel) ? 'disabled' : ''}`}
+              className={`export-option-item ${exportSimulation ? 'active' : ''} ${exporting || (exportSimulation && !exportModel && !exportRoutesExcel) ? 'disabled' : ''}`}
               onClick={() => {
                 if (exporting) return;
                 // Prevent turning off if it's the only one enabled
-                if (exportSimulation && !exportModel) return;
+                if (exportSimulation && !exportModel && !exportRoutesExcel) return;
                 setExportSimulation(!exportSimulation);
               }}
             >
@@ -259,8 +261,47 @@ function ExportButton({ site, onExportComplete }) {
                   checked={exportSimulation}
                   onChange={(e) => {
                     // Prevent turning off if it's the only one enabled
-                    if (!e.target.checked && !exportModel) return;
+                    if (!e.target.checked && !exportModel && !exportRoutesExcel) return;
                     setExportSimulation(e.target.checked);
+                  }}
+                  disabled={exporting}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div
+              className={`export-option-item ${exportRoutesExcel ? 'active' : ''} ${exporting || (exportRoutesExcel && !exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (exporting) return;
+                // Prevent turning off if it's the only one enabled
+                if (exportRoutesExcel && !exportModel && !exportSimulation) return;
+                setExportRoutesExcel(!exportRoutesExcel);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon routes">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <path d="M8 13h2"></path>
+                    <path d="M8 17h2"></path>
+                    <path d="M14 13h2"></path>
+                    <path d="M14 17h2"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Routes Excel</span>
+                  <span className="export-option-desc">Route template format</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportRoutesExcel}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportModel && !exportSimulation) return;
+                    setExportRoutesExcel(e.target.checked);
                   }}
                   disabled={exporting}
                 />
@@ -358,6 +399,19 @@ function ExportButton({ site, onExportComplete }) {
                     <line x1="12" y1="15" x2="12" y2="3"></line>
                   </svg>
                   Ledger
+                </button>
+              )}
+              {files.routes_excel && (
+                <button
+                  className="btn btn-outline-success btn-sm"
+                  onClick={() => handleDownload('routes_excel')}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-1">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  Routes Excel
                 </button>
               )}
             </div>

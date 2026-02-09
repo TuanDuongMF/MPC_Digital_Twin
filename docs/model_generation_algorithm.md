@@ -12,8 +12,9 @@ This document provides comprehensive technical documentation of the model genera
 2. [Data Flow Pipeline](#data-flow-pipeline)
 3. [Core Algorithms](#core-algorithms)
    - [Road Network Generation](#31-road-network-generation)
-   - [Zone Detection](#32-zone-detection)
-   - [Model Assembly](#33-model-assembly)
+   - [Road Intersection Splitting](#32-road-intersection-splitting)
+   - [Zone Detection](#33-zone-detection)
+   - [Model Assembly](#34-model-assembly)
 4. [Data Structures](#data-structures)
 5. [Configuration Parameters](#configuration-parameters)
 6. [Business Rules](#business-rules)
@@ -47,7 +48,15 @@ Telemetry Data (Database or Import)
 │  └───────────────────────────────────────────────────┘  │
 │                          ↓                               │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │ Step 3: detect_zones()                            │  │
+│  │ Step 3: split_roads_at_intersections()            │  │
+│  │   - Find critical nodes (intersections/overlaps)  │  │
+│  │   - Split roads at critical nodes                 │  │
+│  │   - Deduplicate shared segments                   │  │
+│  │   - Output: split_roads[], road_composition{}     │  │
+│  └───────────────────────────────────────────────────┘  │
+│                          ↓                               │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ Step 4: detect_zones()                            │  │
 │  │   - Grid-based stop point clustering              │  │
 │  │   - Payload-based classification                  │  │
 │  │   - Road endpoint linking                         │  │
@@ -55,7 +64,7 @@ Telemetry Data (Database or Import)
 │  └───────────────────────────────────────────────────┘  │
 │                          ↓                               │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │ Step 4: create_model()                            │  │
+│  │ Step 5: create_model()                            │  │
 │  │   - Assemble complete model structure             │  │
 │  │   - Add default settings                          │  │
 │  │   - Calculate camera position                     │  │
@@ -69,33 +78,35 @@ model_{site_name}.json
 ### Component Diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Model Generation System                        │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌──────────────┐ │
-│  │   Data Source   │    │  Road Builder   │    │ Zone Detector│ │
-│  │  ─────────────  │    │  ─────────────  │    │ ──────────── │ │
-│  │  • Database     │───▶│  • Trajectory   │───▶│ • Grid       │ │
-│  │  • Import File  │    │    Grouping     │    │   Clustering │ │
-│  │                 │    │  • Douglas-     │    │ • Payload    │ │
-│  │                 │    │    Peucker      │    │   Analysis   │ │
-│  │                 │    │  • Node Dedup   │    │ • Road Link  │ │
-│  └─────────────────┘    └─────────────────┘    └──────────────┘ │
-│           │                      │                     │         │
-│           └──────────────────────┼─────────────────────┘         │
-│                                  ▼                               │
-│                    ┌─────────────────────────┐                   │
-│                    │    Model Assembler      │                   │
-│                    │   ─────────────────     │                   │
-│                    │   • Structure Builder   │                   │
-│                    │   • Settings Merger     │                   │
-│                    │   • Camera Calculator   │                   │
-│                    └─────────────────────────┘                   │
-│                                  │                               │
-│                                  ▼                               │
-│                           model.json                             │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        Model Generation System                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐  │
+│  │ Data Source │   │Road Builder │   │Road Splitter│   │Zone Detector│  │
+│  │ ─────────── │   │ ─────────── │   │ ─────────── │   │ ─────────── │  │
+│  │ • Database  │──▶│ • Trajectory│──▶│ • Find      │──▶│ • Grid      │  │
+│  │ • Import    │   │   Grouping  │   │   Critical  │   │   Clustering│  │
+│  │   File      │   │ • Douglas-  │   │   Nodes     │   │ • Payload   │  │
+│  │             │   │   Peucker   │   │ • Split at  │   │   Analysis  │  │
+│  │             │   │ • Node      │   │   Intersect │   │ • Road Link │  │
+│  │             │   │   Dedup     │   │ • Dedup     │   │             │  │
+│  │             │   │             │   │   Shared    │   │             │  │
+│  └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘  │
+│         │                 │                 │                 │          │
+│         └─────────────────┴─────────────────┴─────────────────┘          │
+│                                    ▼                                      │
+│                      ┌─────────────────────────┐                         │
+│                      │    Model Assembler      │                         │
+│                      │   ─────────────────     │                         │
+│                      │   • Structure Builder   │                         │
+│                      │   • Settings Merger     │                         │
+│                      │   • Camera Calculator   │                         │
+│                      └─────────────────────────┘                         │
+│                                    │                                      │
+│                                    ▼                                      │
+│                             model.json                                    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -355,7 +366,201 @@ Final Road:
 
 ---
 
-### 3.2 Zone Detection
+### 3.2 Road Intersection Splitting
+
+**Function**: `split_roads_at_intersections()`
+
+**Purpose**: Split roads at intersection and overlap points to ensure roads only share nodes at endpoints. This is required for proper route navigation and simulation.
+
+#### Problem Statement
+
+Roads generated from multiple vehicle trajectories may:
+1. **Intersect**: Cross each other at a common node in the middle
+2. **Overlap**: Share a common path segment
+
+```
+Before Splitting:
+┌────────────────────────────────────────────────────────────┐
+│                                                             │
+│  Road A: [1]─[2]─[3]─[4]─[5]      Intersection at node 3   │
+│                   │                                         │
+│  Road B: [6]─[7]─[3]─[8]─[9]                               │
+│                                                             │
+│  Road C: [1]─[2]─[3]─[10]─[11]   Overlap at nodes 1,2,3    │
+│                                                             │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### Algorithm Steps
+
+##### Step 1: Build Node Usage Map
+
+Track which roads use each node and at what position:
+
+```python
+node_usage = {}  # node_id -> list of (road_id, position_index, is_endpoint)
+
+for road in roads:
+    for idx, node_id in enumerate(road["nodes"]):
+        is_endpoint = (idx == 0 or idx == len(nodes) - 1)
+        node_usage[node_id].append((road_id, idx, is_endpoint))
+```
+
+##### Step 2: Identify Critical Nodes
+
+A node is **critical** (split point) if:
+- It's an endpoint of any road, OR
+- It appears in more than one road
+
+```python
+critical_nodes = set()
+
+for node_id, usages in node_usage.items():
+    # Endpoint of any road
+    if any(is_endpoint for _, _, is_endpoint in usages):
+        critical_nodes.add(node_id)
+    # Used by multiple roads
+    elif len(set(road_id for road_id, _, _ in usages)) > 1:
+        critical_nodes.add(node_id)
+```
+
+##### Step 3: Split Roads at Critical Nodes
+
+For each road, split at critical nodes that appear in its middle:
+
+```python
+for road in roads:
+    nodes = road["nodes"]
+
+    # Find split indices
+    split_indices = [0]  # Start
+    for idx in range(1, len(nodes) - 1):
+        if nodes[idx] in critical_nodes:
+            split_indices.append(idx)
+    split_indices.append(len(nodes) - 1)  # End
+
+    # Create segments between consecutive split points
+    for i in range(len(split_indices) - 1):
+        segment = nodes[split_indices[i]:split_indices[i+1] + 1]
+        raw_segments.append((road_id, segment))
+```
+
+##### Step 4: Deduplicate Shared Segments
+
+Segments with identical node sequences are merged:
+
+```python
+segment_to_roads = {}  # canonical_nodes -> set of original_road_ids
+
+for original_road_id, segment_nodes in raw_segments:
+    # Normalize direction (smaller first node as canonical)
+    if segment_nodes[0] > segment_nodes[-1]:
+        canonical = tuple(reversed(segment_nodes))
+    else:
+        canonical = tuple(segment_nodes)
+
+    segment_to_roads[canonical].add(original_road_id)
+```
+
+##### Step 5: Create Final Segments
+
+```python
+for canonical_nodes, original_road_ids in segment_to_roads.items():
+    is_shared = len(original_road_ids) > 1
+
+    new_road = {
+        "id": new_road_id,
+        "name": f"Road_{new_road_id}_Shared" if is_shared else f"Road_{new_road_id}",
+        "nodes": list(canonical_nodes),
+        "_original_roads": sorted(original_road_ids),
+        "_is_shared": is_shared,
+        ...
+    }
+```
+
+##### Step 6: Build Road Composition Mapping
+
+Map original roads to their new segment IDs:
+
+```python
+road_composition = {}  # original_road_id -> [new_segment_ids]
+
+for road in original_roads:
+    segment_ids = []
+    for segment in split_segments_of(road):
+        segment_ids.append(find_new_id(segment))
+    road_composition[road["id"]] = segment_ids
+```
+
+#### Visual Representation
+
+**Example 1: Intersection**
+
+```
+Input:
+  Road A: [1, 2, 3, 4, 5]
+  Road B: [6, 7, 3, 8, 9]
+
+Critical Nodes: {1, 3, 5, 6, 9}  (endpoints + intersection)
+
+Split Result:
+  Road_1: [1, 2, 3]  ← from Road A
+  Road_2: [3, 4, 5]  ← from Road A
+  Road_3: [6, 7, 3]  ← from Road B
+  Road_4: [3, 8, 9]  ← from Road B
+
+Composition:
+  Road A → [Road_1, Road_2]
+  Road B → [Road_3, Road_4]
+```
+
+**Example 2: Overlap**
+
+```
+Input:
+  Road A: [1, 2, 3, 4, 5]
+  Road B: [1, 2, 3, 6, 7]
+  Road C: [8, 2, 3, 10]
+
+Critical Nodes: {1, 2, 3, 5, 7, 8, 10}  (endpoints + multi-road usage)
+
+Split Result:
+  Road_1_Shared: [1, 2]   ← used by A, B
+  Road_2_Shared: [2, 3]   ← used by A, B, C
+  Road_3: [3, 4, 5]       ← used by A only
+  Road_4: [3, 6, 7]       ← used by B only
+  Road_5: [8, 2]          ← used by C only
+  Road_6: [3, 10]         ← used by C only
+
+Composition:
+  Road A → [Road_1, Road_2, Road_3]
+  Road B → [Road_1, Road_2, Road_4]
+  Road C → [Road_5, Road_2, Road_6]
+```
+
+#### Road Structure After Splitting
+
+```json
+{
+  "id": 1,
+  "name": "Road_1_Shared",
+  "nodes": [1, 2],
+  "is_generated": false,
+  "ways_num": 2,
+  "lanes_num": 1,
+  "_original_roads": [1, 2],
+  "_is_shared": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_original_roads` | [int] | List of original road IDs that use this segment |
+| `_is_shared` | bool | True if segment is shared by multiple original roads |
+
+---
+
+### 3.3 Zone Detection
 
 **Function**: `detect_zones()`
 
@@ -535,7 +740,7 @@ GPS Stop Points (speed ≤ 5 km/h):
 
 ---
 
-### 3.3 Model Assembly
+### 3.4 Model Assembly
 
 **Function**: `create_model()`
 
@@ -783,6 +988,9 @@ if nodes:
 | **No Consecutive Duplicates** | [1, 1, 2] → [1, 2] | Prevents stuck animation |
 | **Minimum 2 Nodes** | Roads with < 2 nodes are discarded | Invalid road segment |
 | **Node Reuse** | Nodes within 5m are merged | Reduces redundancy |
+| **Endpoint-Only Sharing** | Roads can only share nodes at start/end | Enables proper route navigation |
+| **Intersection Splitting** | Roads crossing in middle are split | Prevents ambiguous paths |
+| **Shared Segment Naming** | Shared roads named with "_Shared" suffix | Visual identification |
 
 ### 6.2 Zone Rules
 
@@ -857,6 +1065,7 @@ python scripts/simulation_generator.py --all-sites
 from backend.scripts.simulation_generator import (
     fetch_telemetry_data,
     create_roads_from_trajectories,
+    split_roads_at_intersections,
     detect_zones,
     create_model,
 )
@@ -871,17 +1080,21 @@ nodes, roads = create_roads_from_trajectories(
     min_segment_distance=15.0,
 )
 
-# 3. Detect zones
+# 3. Split roads at intersections
+roads, road_composition = split_roads_at_intersections(roads)
+# road_composition: {original_road_id: [new_segment_ids]}
+
+# 4. Detect zones
 load_zones, dump_zones = detect_zones(
     telemetry, nodes, roads,
     grid_size=10.0,
     min_stop_count=20,
 )
 
-# 4. Assemble model
+# 5. Assemble model
 model = create_model(nodes, roads, load_zones, dump_zones)
 
-# 5. Save to file
+# 6. Save to file
 with open("model.json", "w") as f:
     json.dump(model, f, indent=2)
 ```
@@ -948,6 +1161,20 @@ def detect_road_network(all_points, grid_size=5.0, min_density=3):
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: 2026-02-05*
+*Document Version: 1.1*
+*Last Updated: 2026-02-08*
 *Source: simulation_generator.py analysis*
+
+---
+
+## Changelog
+
+### Version 1.1 (2026-02-08)
+- Added `split_roads_at_intersections()` algorithm (Section 3.2)
+- Updated pipeline diagram with Road Splitter component
+- Updated component diagram
+- Added road splitting business rules
+- Updated programmatic usage example
+
+### Version 1.0 (2026-02-05)
+- Initial documentation

@@ -168,6 +168,7 @@ def process_import_and_export(
     output_base_name: str = None,
     export_model: bool = True,
     export_simulation: bool = True,
+    export_routes_excel: bool = False,
 ):
     """Process import and export in background thread."""
     # Use output_base_name for file naming, fallback to site_name
@@ -273,6 +274,7 @@ def process_import_and_export(
             output_base_name=file_base_name,  # Use import filename for output naming
             export_model=export_model,
             export_simulation=export_simulation,
+            export_routes_excel=export_routes_excel,
         )
 
         print(f"\n[Import] process_site returned: {result is not None}", flush=True)
@@ -353,9 +355,10 @@ def export_files():
         # Get export file type options (default both to True)
         export_model = data.get('export_model', True)
         export_simulation = data.get('export_simulation', True)
+        export_routes_excel = data.get('export_routes_excel', False)
 
         # At least one type must be selected
-        if not export_model and not export_simulation:
+        if not export_model and not export_simulation and not export_routes_excel:
             return jsonify({"error": "At least one export type must be selected"}), 400
 
         # Start export in background thread
@@ -373,6 +376,7 @@ def export_files():
                 sim_time,
                 export_model,
                 export_simulation,
+                export_routes_excel,
             )
         )
         thread.daemon = True
@@ -399,6 +403,7 @@ def process_export(
     sim_time: int,
     export_model: bool = True,
     export_simulation: bool = True,
+    export_routes_excel: bool = False,
 ):
     """Process export in background thread."""
     try:
@@ -443,6 +448,7 @@ def process_export(
                 machines_list=machines_list,
                 export_model=export_model,
                 export_simulation=export_simulation,
+                export_routes_excel=export_routes_excel,
             )
 
             if result:
@@ -490,6 +496,12 @@ def export_events_sse(site_name: str):
         current = get_export_status(site_name)
         yield f"data: {json.dumps(current)}\n\n"
 
+        # If already completed or error, no need to wait for more events
+        if current.get("status") in ("completed", "error"):
+            if key in sse_subscribers and q in sse_subscribers[key]:
+                sse_subscribers[key].remove(q)
+            return
+
         try:
             while True:
                 # Timeout 600s (10 minutes) for long-running exports
@@ -513,7 +525,7 @@ def download_file(site_name: str, file_type: str):
     """Download exported file."""
     try:
         # Validate file type
-        valid_types = ['model', 'des_inputs', 'ledger']
+        valid_types = ['model', 'des_inputs', 'ledger', 'routes_excel']
         if file_type not in valid_types:
             return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
         
@@ -542,7 +554,12 @@ def download_file(site_name: str, file_type: str):
             print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
 
         # Determine mimetype based on file extension
-        mimetype = 'application/gzip' if filename.endswith('.gz') else 'application/json'
+        if filename.endswith('.gz'):
+            mimetype = 'application/gzip'
+        elif filename.endswith('.xlsx'):
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        else:
+            mimetype = 'application/json'
         return send_file(
             file_data,
             as_attachment=True,
@@ -610,11 +627,12 @@ def import_files():
             # Get export file type options
             export_model = request.form.get('export_model', 'true').lower() == 'true'
             export_simulation = request.form.get('export_simulation', 'true').lower() == 'true'
+            export_routes_excel = request.form.get('export_routes_excel', 'false').lower() == 'true'
 
             # At least one type must be selected
-            if not export_model and not export_simulation:
+            if not export_model and not export_simulation and not export_routes_excel:
                 return jsonify({"error": "At least one export type must be selected"}), 400
-        
+
         # Validate parser executable
         if not EXECUTE_FILE_PATH or not os.path.exists(EXECUTE_FILE_PATH):
             return jsonify({
@@ -725,6 +743,7 @@ def import_files():
                         output_base_name,  # Pass output_base_name for file naming
                         export_model,
                         export_simulation,
+                        export_routes_excel,
                     )
                 )
                 thread.daemon = True
@@ -783,6 +802,12 @@ def import_events_sse(site_name: str):
         current = get_import_status(site_name)
         yield f"data: {json.dumps(current)}\n\n"
 
+        # If already completed or error, no need to wait for more events
+        if current.get("status") in ("completed", "error"):
+            if key in sse_subscribers and q in sse_subscribers[key]:
+                sse_subscribers[key].remove(q)
+            return
+
         try:
             while True:
                 # Timeout 600s (10 minutes) for long-running imports
@@ -808,11 +833,11 @@ def download_imported_file(site_name: str, file_type: str):
 
     Args:
         site_name: The output_base_name used during import (e.g., "ABC" for ABC.zip)
-        file_type: One of 'model', 'des_inputs', 'ledger'
+        file_type: One of 'model', 'des_inputs', 'ledger', 'routes_excel'
     """
     try:
         # Validate file type
-        valid_types = ['model', 'des_inputs', 'ledger']
+        valid_types = ['model', 'des_inputs', 'ledger', 'routes_excel']
         if file_type not in valid_types:
             return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
         
@@ -841,7 +866,12 @@ def download_imported_file(site_name: str, file_type: str):
             print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
 
         # Determine mimetype based on file extension
-        mimetype = 'application/gzip' if filename.endswith('.gz') else 'application/json'
+        if filename.endswith('.gz'):
+            mimetype = 'application/gzip'
+        elif filename.endswith('.xlsx'):
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        else:
+            mimetype = 'application/json'
         return send_file(
             file_data,
             as_attachment=True,

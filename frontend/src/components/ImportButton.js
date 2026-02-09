@@ -13,6 +13,7 @@ function ImportButton({ site, onImportComplete }) {
   // Export file type selection
   const [exportModel, setExportModel] = useState(true);
   const [exportSimulation, setExportSimulation] = useState(true);
+  const [exportRoutesExcel, setExportRoutesExcel] = useState(false);
 
   const DEFAULT_SITE_NAME = 'DefaultSite';
   const [importBaseName, setImportBaseName] = useState(DEFAULT_SITE_NAME);
@@ -138,6 +139,7 @@ function ImportButton({ site, onImportComplete }) {
       formData.append('export', 'true');
       formData.append('export_model', exportModel ? 'true' : 'false');
       formData.append('export_simulation', exportSimulation ? 'true' : 'false');
+      formData.append('export_routes_excel', exportRoutesExcel ? 'true' : 'false');
 
       // Add file to FormData
       formData.append('files', file);
@@ -290,11 +292,11 @@ function ImportButton({ site, onImportComplete }) {
           </div>
           <div className="export-options-grid">
             <div
-              className={`export-option-item ${exportModel ? 'active' : ''} ${importing || status === 'processing' || (exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              className={`export-option-item ${exportModel ? 'active' : ''} ${importing || status === 'processing' || (exportModel && !exportSimulation && !exportRoutesExcel) ? 'disabled' : ''}`}
               onClick={() => {
                 if (importing || status === 'processing') return;
                 // Prevent turning off if it's the only one enabled
-                if (exportModel && !exportSimulation) return;
+                if (exportModel && !exportSimulation && !exportRoutesExcel) return;
                 setExportModel(!exportModel);
               }}
             >
@@ -318,7 +320,7 @@ function ImportButton({ site, onImportComplete }) {
                   checked={exportModel}
                   onChange={(e) => {
                     // Prevent turning off if it's the only one enabled
-                    if (!e.target.checked && !exportSimulation) return;
+                    if (!e.target.checked && !exportSimulation && !exportRoutesExcel) return;
                     setExportModel(e.target.checked);
                   }}
                   disabled={importing || status === 'processing'}
@@ -327,11 +329,11 @@ function ImportButton({ site, onImportComplete }) {
               </label>
             </div>
             <div
-              className={`export-option-item ${exportSimulation ? 'active' : ''} ${importing || status === 'processing' || (exportSimulation && !exportModel) ? 'disabled' : ''}`}
+              className={`export-option-item ${exportSimulation ? 'active' : ''} ${importing || status === 'processing' || (exportSimulation && !exportModel && !exportRoutesExcel) ? 'disabled' : ''}`}
               onClick={() => {
                 if (importing || status === 'processing') return;
                 // Prevent turning off if it's the only one enabled
-                if (exportSimulation && !exportModel) return;
+                if (exportSimulation && !exportModel && !exportRoutesExcel) return;
                 setExportSimulation(!exportSimulation);
               }}
             >
@@ -355,8 +357,47 @@ function ImportButton({ site, onImportComplete }) {
                   checked={exportSimulation}
                   onChange={(e) => {
                     // Prevent turning off if it's the only one enabled
-                    if (!e.target.checked && !exportModel) return;
+                    if (!e.target.checked && !exportModel && !exportRoutesExcel) return;
                     setExportSimulation(e.target.checked);
+                  }}
+                  disabled={importing || status === 'processing'}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div
+              className={`export-option-item ${exportRoutesExcel ? 'active' : ''} ${importing || status === 'processing' || (exportRoutesExcel && !exportModel && !exportSimulation) ? 'disabled' : ''}`}
+              onClick={() => {
+                if (importing || status === 'processing') return;
+                // Prevent turning off if it's the only one enabled
+                if (exportRoutesExcel && !exportModel && !exportSimulation) return;
+                setExportRoutesExcel(!exportRoutesExcel);
+              }}
+            >
+              <div className="export-option-info">
+                <div className="export-option-icon routes">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <path d="M8 13h2"></path>
+                    <path d="M8 17h2"></path>
+                    <path d="M14 13h2"></path>
+                    <path d="M14 17h2"></path>
+                  </svg>
+                </div>
+                <div className="export-option-text">
+                  <span className="export-option-label">Routes Excel</span>
+                  <span className="export-option-desc">Route template format</span>
+                </div>
+              </div>
+              <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={exportRoutesExcel}
+                  onChange={(e) => {
+                    // Prevent turning off if it's the only one enabled
+                    if (!e.target.checked && !exportModel && !exportSimulation) return;
+                    setExportRoutesExcel(e.target.checked);
                   }}
                   disabled={importing || status === 'processing'}
                 />
@@ -417,6 +458,20 @@ function ImportButton({ site, onImportComplete }) {
                       <line x1="12" y1="15" x2="12" y2="3"></line>
                     </svg>
                     Ledger
+                  </button>
+                )}
+                {exportFiles.routes_excel && (
+                  <button
+                    className="btn btn-sm btn-outline-success"
+                    onClick={() => handleDownloadFile('routes_excel', exportFiles.routes_excel)}
+                    title="Download Routes Excel File"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="me-1">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                      <polyline points="7 10 12 15 17 10"></polyline>
+                      <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                    Routes Excel
                   </button>
                 )}
               </div>

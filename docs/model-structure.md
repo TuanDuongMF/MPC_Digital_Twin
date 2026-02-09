@@ -172,6 +172,27 @@ Roads (segments) connect nodes to form the haul road network.
 | `rolling_resistance` | number/string | % | No | Rolling resistance coefficient |
 | `traction_coefficient` | number/string | - | No | Traction coefficient |
 | `offset` | number | meters | No | Road offset from centerline |
+| `_original_roads` | array | - | No | List of original road IDs (after intersection splitting) |
+| `_is_shared` | boolean | - | No | Whether this segment is shared by multiple roads |
+
+### Road Naming Convention
+
+After intersection splitting, roads are named:
+- `Road_N` - Regular road segment (used by single original road)
+- `Road_N_Shared` - Shared segment (used by multiple original roads)
+
+### Road Intersection Rules
+
+Roads are split at intersections to ensure:
+- Roads only share nodes at **start** or **end** points
+- No node appears in the **middle** of multiple roads
+- Shared segments are deduplicated
+
+Example:
+```
+Before: Road A [1,2,3,4,5], Road B [6,7,3,8,9]  (intersection at node 3)
+After:  Road_1 [1,2,3], Road_2 [3,4,5], Road_3 [6,7,3], Road_4 [3,8,9]
+```
 
 ---
 

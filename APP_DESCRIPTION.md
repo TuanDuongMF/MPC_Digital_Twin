@@ -214,6 +214,12 @@ Output Files:
    - Roads connect nodes based on machine travel patterns
    - Road properties include: distance, average efficiency, loss summary
 
+4. **Road Intersection Splitting**:
+   - Roads can only share nodes at start or end points
+   - If roads share nodes in the middle, they are split at intersection points
+   - Overlapping segments are deduplicated and marked with "_Shared" suffix
+   - Routes are updated to reference new segment IDs
+
 ### 6. Loss Analysis
 
 **Productivity Loss Calculation:**
@@ -283,6 +289,7 @@ Fetch telemetry data (with limit, sample_interval)
     ↓
 process_site():
     ├── Detect roads (grid clustering)
+    ├── Split roads at intersections
     ├── Detect zones (stop clustering)
     ├── Analyze cycles
     └── Generate events
@@ -306,7 +313,12 @@ convert_imported_records_to_telemetry()
     ↓
 Create machine info from telemetry
     ↓
-process_site() with telemetry_data parameter
+process_site() with telemetry_data parameter:
+    ├── Detect roads (grid clustering)
+    ├── Split roads at intersections
+    ├── Detect zones (stop clustering)
+    ├── Analyze cycles
+    └── Generate events
     ↓
 Generate simulation files
     ↓
@@ -421,6 +433,13 @@ Status: completed → Files available for download
    - Dump zones: `SPOTTING_AT_SINK` segments
    - Minimum 2 points required to form a valid zone polygon
 
+4. **Road Intersection Rules**:
+   - Roads can only share nodes at their start or end points
+   - If roads share nodes in the middle, they are split at those intersection points
+   - Overlapping road segments (same start/end nodes) are deduplicated
+   - Shared segments are named with "_Shared" suffix (e.g., "Road_1_Shared")
+   - Routes are automatically updated to reference new segment IDs
+
 ### Data Processing Rules
 
 1. **Coordinate System**:
@@ -491,6 +510,7 @@ Status: completed → Files available for download
 **simulation_generator** (`scripts/simulation_generator.py`):
 - Main export processing logic
 - Road detection using grid-based clustering
+- Road intersection splitting and segment deduplication
 - Zone detection using stop-based clustering
 - Generates model, DES inputs, and events ledger files
 
