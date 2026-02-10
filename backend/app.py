@@ -263,6 +263,7 @@ def process_import_and_export(
             grid_size=config.get('grid_size', DEFAULT_CONFIG['road_detection']['grid_size']),
             min_density=config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density']),
             simplify_epsilon=config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon']),
+            max_node_distance=config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance']),
             zone_grid_size=config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size']),
             zone_min_stops=config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count']),
             sim_time=config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time']),
@@ -348,6 +349,7 @@ def export_files():
         grid_size = config.get('grid_size', DEFAULT_CONFIG['road_detection']['grid_size'])
         min_density = config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density'])
         simplify_epsilon = config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon'])
+        max_node_distance = config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance'])
         zone_grid_size = config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size'])
         zone_min_stops = config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])
         sim_time = config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])
@@ -371,6 +373,7 @@ def export_files():
                 grid_size,
                 min_density,
                 simplify_epsilon,
+                max_node_distance,
                 zone_grid_size,
                 zone_min_stops,
                 sim_time,
@@ -398,6 +401,7 @@ def process_export(
     grid_size: float,
     min_density: int,
     simplify_epsilon: float,
+    max_node_distance: float,
     zone_grid_size: float,
     zone_min_stops: int,
     sim_time: int,
@@ -441,6 +445,7 @@ def process_export(
                 grid_size=grid_size,
                 min_density=min_density,
                 simplify_epsilon=simplify_epsilon,
+                max_node_distance=max_node_distance,
                 zone_grid_size=zone_grid_size,
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,

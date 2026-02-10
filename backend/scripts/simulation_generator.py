@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
         "grid_size": 5.0,
         "min_density": 3,
         "simplify_epsilon": 5.0,
+        "max_node_distance": 500.0,
     },
     "zone_detection": {
         "grid_size": 10.0,
@@ -610,21 +611,24 @@ def create_roads_from_trajectories(
     telemetry_data: List[Tuple],
     simplify_epsilon: float = 10.0,
     min_segment_distance: float = 15.0,
+    max_node_distance: float = 500.0,
     coordinates_in_meters: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Create road network from actual vehicle trajectories.
-    
+
     This ensures nodes and roads follow the actual path of vehicles,
     maintaining correct sequence order for animation playback.
-    
+
     Args:
         telemetry_data: Sorted telemetry data (by machine, cycle, segment, interval)
         simplify_epsilon: Douglas-Peucker simplification threshold (meters)
         min_segment_distance: Minimum distance between nodes (meters)
+        max_node_distance: Maximum allowed distance between consecutive nodes (meters).
+                          Trajectories are split at gaps exceeding this threshold.
         coordinates_in_meters: If True, coordinates are already in meters (for imported data).
                               If False, coordinates are in millimeters (for database data).
-    
+
     Returns:
         Tuple of (nodes list, roads list)
     """
@@ -654,7 +658,30 @@ def create_roads_from_trajectories(
         machine_trajectories[machine_id].append(coord)
     
     print(f"    Found {len(machine_trajectories)} machine trajectories")
-    
+
+    # Split trajectories at distance gaps exceeding max_node_distance
+    # This prevents connecting unrelated trajectory segments (e.g., different cycles)
+    split_trajectories = []
+    total_splits = 0
+    for machine_id, trajectory in machine_trajectories.items():
+        current_segment = [trajectory[0]]
+        for i in range(1, len(trajectory)):
+            dist = calculate_distance(trajectory[i - 1], trajectory[i])
+            if dist > max_node_distance:
+                # Gap detected - finish current segment and start new one
+                if len(current_segment) >= 2:
+                    split_trajectories.append(current_segment)
+                total_splits += 1
+                current_segment = [trajectory[i]]
+            else:
+                current_segment.append(trajectory[i])
+        if len(current_segment) >= 2:
+            split_trajectories.append(current_segment)
+
+    if total_splits > 0:
+        print(f"    Split trajectories at {total_splits} gaps > {max_node_distance}m "
+              f"({len(machine_trajectories)} machines -> {len(split_trajectories)} segments)")
+
     # Create unified node map (avoid duplicate nodes at same location)
     all_nodes = []
     node_id = 1
@@ -686,63 +713,77 @@ def create_roads_from_trajectories(
         node_id += 1
         return new_node["id"]
     
-    # Create roads from each machine's trajectory
+    # Create roads from split trajectory segments
     roads = []
     road_id = 1
 
-    machine_iter = machine_trajectories.items()
+    traj_iter = split_trajectories
     if TQDM_AVAILABLE:
-        machine_iter = tqdm(list(machine_iter), desc="    Building roads", unit="machine")
+        traj_iter = tqdm(split_trajectories, desc="    Building roads", unit="segment")
 
-    for machine_id, trajectory in machine_iter:
+    for trajectory in traj_iter:
         if len(trajectory) < 2:
             continue
-        
+
         # Simplify trajectory using Douglas-Peucker
         simplified = douglas_peucker(trajectory, simplify_epsilon)
-        
+
         if len(simplified) < 2:
             continue
-        
+
         # Further filter by minimum segment distance
         filtered_points = [simplified[0]]
         for point in simplified[1:]:
             if calculate_distance(filtered_points[-1], point) >= min_segment_distance:
                 filtered_points.append(point)
-        
+
         # Ensure last point is included
         if len(filtered_points) >= 1 and filtered_points[-1] != simplified[-1]:
             if calculate_distance(filtered_points[-1], simplified[-1]) >= min_segment_distance / 2:
                 filtered_points.append(simplified[-1])
-        
+
         if len(filtered_points) < 2:
             continue
-        
-        # Create nodes for this trajectory
-        road_node_ids = []
-        for point in filtered_points:
-            nid = get_or_create_node(point)
-            # Avoid consecutive duplicates
-            if not road_node_ids or road_node_ids[-1] != nid:
-                road_node_ids.append(nid)
-        
-        if len(road_node_ids) >= 2:
-            road = {
-                "id": road_id,
-                "name": f"Road_{road_id}",
-                "nodes": road_node_ids,
-                "is_generated": False,
-                "ways_num": 2,
-                "lanes_num": 1,
-                "banking": "",
-                "lane_width": "",
-                "speed_limit": "",
-                "rolling_resistance": "",
-                "traction_coefficient": "",
-                "offset": 0,
-            }
-            roads.append(road)
-            road_id += 1
+
+        # Safety net: split at any remaining gaps > max_node_distance after simplification
+        road_segments = []
+        current_segment_points = [filtered_points[0]]
+        for point in filtered_points[1:]:
+            if calculate_distance(current_segment_points[-1], point) > max_node_distance:
+                if len(current_segment_points) >= 2:
+                    road_segments.append(current_segment_points)
+                current_segment_points = [point]
+            else:
+                current_segment_points.append(point)
+        if len(current_segment_points) >= 2:
+            road_segments.append(current_segment_points)
+
+        # Create roads from each valid segment
+        for segment_points in road_segments:
+            road_node_ids = []
+            for point in segment_points:
+                nid = get_or_create_node(point)
+                # Avoid consecutive duplicates
+                if not road_node_ids or road_node_ids[-1] != nid:
+                    road_node_ids.append(nid)
+
+            if len(road_node_ids) >= 2:
+                road = {
+                    "id": road_id,
+                    "name": f"Road_{road_id}",
+                    "nodes": road_node_ids,
+                    "is_generated": False,
+                    "ways_num": 2,
+                    "lanes_num": 1,
+                    "banking": "",
+                    "lane_width": "",
+                    "speed_limit": "",
+                    "rolling_resistance": "",
+                    "traction_coefficient": "",
+                    "offset": 0,
+                }
+                roads.append(road)
+                road_id += 1
     
     print(f"    Created {len(all_nodes)} nodes and {len(roads)} roads from trajectories")
 
@@ -1980,9 +2021,11 @@ def analyze_hauler_trips_from_telemetry(
         return best if best_dist < 500 else None  # Max 500m from zone center
 
     # Group telemetry by machine_id and sort by time
+    # Tuple format: (machine_id[0], segment_id[1], cycle_id[2], interval[3],
+    #                 pathEasting[4], pathNorthing[5], pathElevation[6], ...)
     machine_data = {}
     for row in telemetry_data:
-        machine_id = row[1] if len(row) > 1 else None
+        machine_id = row[0] if len(row) > 0 else None
         if machine_id is None:
             continue
 
@@ -1990,7 +2033,7 @@ def analyze_hauler_trips_from_telemetry(
             machine_data[machine_id] = []
 
         # Extract data: (timestamp, x, y, payload)
-        timestamp = row[2] if len(row) > 2 else 0
+        timestamp = row[3] if len(row) > 3 else 0
         if coordinates_in_meters:
             x = float(row[4]) if len(row) > 4 and row[4] else 0
             y = float(row[5]) if len(row) > 5 and row[5] else 0
@@ -2050,20 +2093,28 @@ def analyze_hauler_trips_from_telemetry(
 
 def create_material_schedule_from_trips(
     trips_by_machine: Dict[int, List[Dict]],
-    machines: Dict[int, Dict] = None,
+    routes: List[Dict] = None,
+    haulers: List[Dict] = None,
+    machine_id_to_hauler_group: Dict[int, int] = None,
+    load_zones: List[Dict] = None,
+    dump_zones: List[Dict] = None,
     default_density: float = 1960.19,
     default_material: str = "Ore",
 ) -> List[Dict]:
     """
     Create material schedule data from analyzed hauler trips.
 
-    Each unique combination of (machine_id, load_zone, dump_zone) creates
-    one material schedule item with num_of_hauler = 1 (since each hauler group
-    contains exactly 1 hauler).
+    Groups trips by (hauler_group_id, load_zone, dump_zone) based on actual
+    GPS data. Matches routes by zone pair and validates that total num_of_hauler
+    per hauler_group_id does not exceed the group's number_of_haulers capacity.
 
     Args:
         trips_by_machine: Dictionary from analyze_hauler_trips_from_telemetry
-        machines: Optional machine info dictionary
+        routes: List of route dictionaries for route matching
+        haulers: List of hauler dictionaries from model
+        machine_id_to_hauler_group: Mapping of machine_id to hauler group_id
+        load_zones: List of load zone dictionaries
+        dump_zones: List of dump zone dictionaries
         default_density: Default material density
         default_material: Default material name
 
@@ -2073,32 +2124,69 @@ def create_material_schedule_from_trips(
     if not trips_by_machine:
         return []
 
-    # Collect unique (machine_id, lz_name, dz_name) combinations
-    unique_routes = set()
-    for machine_id, trips in trips_by_machine.items():
-        for trip in trips:
-            key = (machine_id, trip["load_zone_name"], trip["dump_zone_name"])
-            unique_routes.add(key)
+    # Fallback: if no mapping provided, each machine is its own group
+    if not machine_id_to_hauler_group:
+        all_machine_ids = sorted(trips_by_machine.keys())
+        machine_id_to_hauler_group = {
+            mid: idx for idx, mid in enumerate(all_machine_ids, start=1)
+        }
 
-    # Build material schedule items - one per unique (hauler, route) combination
+    # Build hauler group capacity: group_id -> total number_of_haulers
+    group_capacity = {}
+    if haulers:
+        for h in haulers:
+            gid = h.get("group_id")
+            if gid is not None:
+                group_capacity[gid] = group_capacity.get(gid, 0) + h.get("number_of_haulers", 1)
+
+    # Group trips by (hauler_group_id, load_zone_name, dump_zone_name)
+    # and track unique machines per combination
+    group_zone_machines = {}
+    for machine_id, trips in trips_by_machine.items():
+        group_id = machine_id_to_hauler_group.get(machine_id)
+        if group_id is None:
+            continue
+
+        for trip in trips:
+            lz_name = trip["load_zone_name"]
+            dz_name = trip["dump_zone_name"]
+            key = (group_id, lz_name, dz_name)
+            if key not in group_zone_machines:
+                group_zone_machines[key] = set()
+            group_zone_machines[key].add(machine_id)
+
+    # Build material schedule items with capacity validation
     material_data = []
-    hauler_group_id = 1
-    for idx, (machine_id, lz_name, dz_name) in enumerate(sorted(unique_routes), start=1):
+    group_assigned = {}  # group_id -> total num_of_hauler assigned so far
+
+    for group_id, lz_name, dz_name in sorted(group_zone_machines.keys()):
+        unique_machines = group_zone_machines[(group_id, lz_name, dz_name)]
+        num_haulers = len(unique_machines)
+
+        # Validate: total assigned for this group must not exceed capacity
+        current_assigned = group_assigned.get(group_id, 0)
+        max_capacity = group_capacity.get(group_id, num_haulers)
+        remaining = max_capacity - current_assigned
+        if remaining <= 0:
+            continue
+        num_haulers = min(num_haulers, remaining)
+
+        group_assigned[group_id] = current_assigned + num_haulers
+
         item = {
-            "id": idx,
+            "id": len(material_data) + 1,
             "load_zone": lz_name,
             "dump_zone": dz_name,
             "route": "",
             "auto_generate_route": True,
             "material": default_material,
             "density": default_density,
-            "num_of_hauler": 1,
+            "num_of_hauler": num_haulers,
             "assigned_machine_type": "Hauler",
             "multiple_routes": False,
-            "hauler_group_id": hauler_group_id,
+            "hauler_group_id": group_id,
         }
         material_data.append(item)
-        hauler_group_id += 1
 
     return material_data
 
@@ -2110,6 +2198,7 @@ def create_material_schedule_data(
     haulers: List[Dict] = None,
     telemetry_data: List[Tuple] = None,
     coordinates_in_meters: bool = False,
+    machine_id_to_hauler_group: Dict[int, int] = None,
     default_density: float = 1960.19,
     default_material: str = "Ore",
 ) -> List[Dict]:
@@ -2127,6 +2216,7 @@ def create_material_schedule_data(
         haulers: Optional list of hauler dictionaries
         telemetry_data: Optional telemetry data for actual trip analysis
         coordinates_in_meters: Whether telemetry coordinates are in meters
+        machine_id_to_hauler_group: Mapping of machine_id to hauler group_id
         default_density: Default material density in kg/m³
         default_material: Default material name
 
@@ -2141,6 +2231,11 @@ def create_material_schedule_data(
         if trips_by_machine:
             return create_material_schedule_from_trips(
                 trips_by_machine,
+                routes=routes,
+                haulers=haulers,
+                machine_id_to_hauler_group=machine_id_to_hauler_group,
+                load_zones=load_zones,
+                dump_zones=dump_zones,
                 default_density=default_density,
                 default_material=default_material,
             )
@@ -2153,42 +2248,54 @@ def create_material_schedule_data(
     lz_lookup = {z["id"]: z.get("name", f"Load zone {z['id']}") for z in load_zones}
     dz_lookup = {z["id"]: z.get("name", f"Dump zone {z['id']}") for z in dump_zones}
 
-    # Count haulers per route if haulers provided
-    haulers_per_route = {}
+    # Build hauler group capacity: group_id -> total number_of_haulers
+    group_capacity = {}
     if haulers:
-        for hauler in haulers:
-            route_id = hauler.get("initial_conditions", {}).get("route_id")
-            if route_id is not None:
-                haulers_per_route[route_id] = haulers_per_route.get(route_id, 0) + hauler.get("number_of_haulers", 1)
+        for h in haulers:
+            gid = h.get("group_id")
+            if gid is not None:
+                group_capacity[gid] = group_capacity.get(gid, 0) + h.get("number_of_haulers", 1)
 
-    # Default haulers per route if no hauler info available
-    total_haulers = sum(haulers_per_route.values()) if haulers_per_route else len(routes) * 4
-    default_haulers = max(1, total_haulers // len(routes)) if routes else 4
+    sorted_groups = sorted(group_capacity.keys()) if group_capacity else []
+    group_assigned = {}  # group_id -> total assigned so far
 
     material_data = []
-    for idx, route in enumerate(routes, start=1):
+    for route in routes:
         lz_id = route.get("load_zone")
         dz_id = route.get("dump_zone")
 
         lz_name = lz_lookup.get(lz_id, f"Load zone {lz_id}")
         dz_name = dz_lookup.get(dz_id, f"Dump zone {dz_id}")
-        route_name = route.get("name", "")
 
-        # Get hauler count for this route
-        num_haulers = haulers_per_route.get(route.get("id"), default_haulers)
+        # Find a hauler group with remaining capacity
+        assigned_group = None
+        num_haulers = 1
+        for gid in sorted_groups:
+            capacity = group_capacity.get(gid, 0)
+            used = group_assigned.get(gid, 0)
+            remaining = capacity - used
+            if remaining > 0:
+                assigned_group = gid
+                num_haulers = 1
+                group_assigned[gid] = used + num_haulers
+                break
+
+        if assigned_group is None:
+            # No hauler capacity left, skip this route
+            continue
 
         item = {
-            "id": idx,
+            "id": len(material_data) + 1,
             "load_zone": lz_name,
             "dump_zone": dz_name,
-            "route": route_name,
+            "route": "",
             "auto_generate_route": True,
             "material": default_material,
             "density": default_density,
             "num_of_hauler": num_haulers,
             "assigned_machine_type": "Hauler",
             "multiple_routes": False,
-            "hauler_group_id": 1,
+            "hauler_group_id": assigned_group,
         }
         material_data.append(item)
 
@@ -2202,6 +2309,7 @@ def create_operations_structure(
     haulers: List[Dict] = None,
     telemetry_data: List[Tuple] = None,
     coordinates_in_meters: bool = False,
+    machine_id_to_hauler_group: Dict[int, int] = None,
     schedule_name: str = "Material Schedule 1",
     scheduling_method: str = "grouped_assignment",
 ) -> Dict:
@@ -2215,6 +2323,7 @@ def create_operations_structure(
         haulers: Optional list of hauler dictionaries
         telemetry_data: Optional telemetry data for actual trip analysis
         coordinates_in_meters: Whether telemetry coordinates are in meters
+        machine_id_to_hauler_group: Mapping of machine_id to hauler group_id
         schedule_name: Name for the material schedule
         scheduling_method: Scheduling method (grouped_assignment, production_target_based, etc.)
 
@@ -2225,6 +2334,7 @@ def create_operations_structure(
         routes, load_zones, dump_zones, haulers,
         telemetry_data=telemetry_data,
         coordinates_in_meters=coordinates_in_meters,
+        machine_id_to_hauler_group=machine_id_to_hauler_group,
     )
 
     return {
@@ -3084,6 +3194,7 @@ def create_model(
         model["chargers"] = chargers
 
         hauler_id = 1
+        machine_id_to_hauler_group = {}
         for machine_id, machine_info in machines.items():
             # Skip machines without events if filter is provided
             if machines_with_events is not None and machine_id not in machines_with_events:
@@ -3174,10 +3285,22 @@ def create_model(
             else:
                 hauler["fuel_tank"] = spec_data.get("fuel_tank", 3785) if spec_data else 3785
 
+            machine_id_to_hauler_group[machine_id] = hauler_id  # group_id == hauler_id
             model_haulers.append(hauler)
             hauler_id += 1
 
     model["haulers"] = model_haulers
+
+    # Rebuild operations with hauler group mapping for accurate material schedules
+    if model_haulers:
+        model["operations"] = create_operations_structure(
+            routes, load_zones, dump_zones, model_haulers,
+            telemetry_data=telemetry_data,
+            coordinates_in_meters=coordinates_in_meters,
+            machine_id_to_hauler_group=machine_id_to_hauler_group,
+            schedule_name="Material Schedule 1",
+            scheduling_method="grouped_assignment"
+        )
 
     # Build loaders list from load_zones (one loader per load_zone)
     model_loaders = []
@@ -3418,6 +3541,8 @@ def _create_des_operations(
     model_dump_zones: List[Dict] = None,
     telemetry_data: List[Tuple] = None,
     coordinates_in_meters: bool = False,
+    machine_id_to_hauler_group: Dict[int, int] = None,
+    model_routes: List[Dict] = None,
 ) -> Dict:
     """
     Create operations structure for DES inputs.
@@ -3434,6 +3559,8 @@ def _create_des_operations(
         model_dump_zones: Model dump zones with detected_location (for trip analysis)
         telemetry_data: Optional telemetry data for actual trip analysis
         coordinates_in_meters: Whether telemetry coordinates are in meters
+        machine_id_to_hauler_group: Mapping of machine_id to hauler group_id
+        model_routes: Model routes for route matching in material schedule
 
     Returns:
         Operations dictionary with material_schedules
@@ -3446,7 +3573,14 @@ def _create_des_operations(
             telemetry_data, model_load_zones, model_dump_zones, coordinates_in_meters
         )
         if trips_by_machine:
-            material_data = create_material_schedule_from_trips(trips_by_machine)
+            material_data = create_material_schedule_from_trips(
+                trips_by_machine,
+                routes=model_routes,
+                haulers=haulers,
+                machine_id_to_hauler_group=machine_id_to_hauler_group,
+                load_zones=model_load_zones,
+                dump_zones=model_dump_zones,
+            )
 
     # Fallback: generate from DES routes
     if not material_data:
@@ -4225,6 +4359,7 @@ def create_des_inputs(
             model_dump_zones=dump_zones,
             telemetry_data=telemetry_data,
             coordinates_in_meters=coordinates_in_meters,
+            model_routes=model.get("routes", []),
         ),
         "override_parameters": {},
         "intersections": [],
@@ -4247,6 +4382,7 @@ def process_site(
     grid_size: float = 5.0,
     min_density: int = 3,
     simplify_epsilon: float = 5.0,
+    max_node_distance: float = 500.0,
     zone_grid_size: float = 10.0,
     zone_min_stops: int = 20,
     sim_time: int = 480,
@@ -4273,6 +4409,7 @@ def process_site(
         grid_size: Grid size for road detection
         min_density: Minimum density for road detection
         simplify_epsilon: Simplify epsilon for road detection
+        max_node_distance: Maximum allowed distance between consecutive road nodes (meters)
         zone_grid_size: Grid size for zone detection
         zone_min_stops: Minimum stops for zone detection
         sim_time: Simulation time
@@ -4359,6 +4496,7 @@ def process_site(
         telemetry_data,
         simplify_epsilon=simplify_epsilon,
         min_segment_distance=15.0,
+        max_node_distance=max_node_distance,
         coordinates_in_meters=coordinates_in_meters,
     )
 
@@ -4640,6 +4778,7 @@ Config file parameters can be overridden by CLI arguments.
     grid_size = args.grid_size if args.grid_size is not None else config["road_detection"]["grid_size"]
     min_density = args.min_density if args.min_density is not None else config["road_detection"]["min_density"]
     simplify_epsilon = config["road_detection"]["simplify_epsilon"]
+    max_node_distance = config["road_detection"]["max_node_distance"]
     zone_grid_size = config["zone_detection"]["grid_size"]
     zone_min_stops = config["zone_detection"]["min_stop_count"]
     sim_time = args.sim_time if args.sim_time is not None else config["simulation"]["sim_time"]
@@ -4653,6 +4792,7 @@ Config file parameters can be overridden by CLI arguments.
     print(f"    road_detection.grid_size: {grid_size}")
     print(f"    road_detection.min_density: {min_density}")
     print(f"    road_detection.simplify_epsilon: {simplify_epsilon}")
+    print(f"    road_detection.max_node_distance: {max_node_distance}")
     print(f"    zone_detection.grid_size: {zone_grid_size}")
     print(f"    zone_detection.min_stop_count: {zone_min_stops}")
     print(f"    simulation.sim_time: {sim_time}")
@@ -4730,6 +4870,7 @@ Config file parameters can be overridden by CLI arguments.
                 grid_size=grid_size,
                 min_density=min_density,
                 simplify_epsilon=simplify_epsilon,
+                max_node_distance=max_node_distance,
                 zone_grid_size=zone_grid_size,
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,
