@@ -264,6 +264,7 @@ def process_import_and_export(
             min_density=config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density']),
             simplify_epsilon=config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon']),
             max_node_distance=config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance']),
+            merge_tolerance=config.get('merge_tolerance', DEFAULT_CONFIG['road_detection']['merge_tolerance']),
             zone_grid_size=config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size']),
             zone_min_stops=config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count']),
             sim_time=config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time']),
@@ -350,6 +351,7 @@ def export_files():
         min_density = config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density'])
         simplify_epsilon = config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon'])
         max_node_distance = config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance'])
+        merge_tolerance = config.get('merge_tolerance', DEFAULT_CONFIG['road_detection']['merge_tolerance'])
         zone_grid_size = config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size'])
         zone_min_stops = config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])
         sim_time = config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])
@@ -374,6 +376,7 @@ def export_files():
                 min_density,
                 simplify_epsilon,
                 max_node_distance,
+                merge_tolerance,
                 zone_grid_size,
                 zone_min_stops,
                 sim_time,
@@ -402,6 +405,7 @@ def process_export(
     min_density: int,
     simplify_epsilon: float,
     max_node_distance: float,
+    merge_tolerance: float,
     zone_grid_size: float,
     zone_min_stops: int,
     sim_time: int,
@@ -446,6 +450,7 @@ def process_export(
                 min_density=min_density,
                 simplify_epsilon=simplify_epsilon,
                 max_node_distance=max_node_distance,
+                merge_tolerance=merge_tolerance,
                 zone_grid_size=zone_grid_size,
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,

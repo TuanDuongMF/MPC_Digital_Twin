@@ -102,6 +102,7 @@ DEFAULT_CONFIG = {
         "min_density": 3,
         "simplify_epsilon": 5.0,
         "max_node_distance": 500.0,
+        "merge_tolerance": 15.0,
     },
     "zone_detection": {
         "grid_size": 10.0,
@@ -605,6 +606,370 @@ def perpendicular_distance(point: Tuple, line_start: Tuple, line_end: Tuple) -> 
         return math.sqrt((x0 - x1) ** 2 + (y0 - y1) ** 2)
     
     return abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1) / line_len
+
+
+def point_to_segment_distance(
+    point: Tuple[float, float, float],
+    seg_start: Tuple[float, float, float],
+    seg_end: Tuple[float, float, float],
+) -> Tuple[float, float]:
+    """
+    Calculate minimum 2D distance from point to line segment (clamped projection).
+
+    Unlike perpendicular_distance() which uses infinite line projection,
+    this function clamps the projection to the segment endpoints.
+
+    Returns:
+        (distance, t) where distance is 2D distance and t is parameter [0,1]
+    """
+    px, py = point[0], point[1]
+    ax, ay = seg_start[0], seg_start[1]
+    bx, by = seg_end[0], seg_end[1]
+
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+
+    if seg_len_sq == 0:
+        dist = math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        return (dist, 0.0)
+
+    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+
+    proj_x = ax + t * dx
+    proj_y = ay + t * dy
+    dist = math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+    return (dist, t)
+
+
+def point_to_polyline_distance(
+    point: Tuple[float, float, float],
+    polyline_coords: List[Tuple[float, float, float]],
+) -> Tuple[float, float]:
+    """
+    Calculate min distance from point to polyline and distance-along-polyline
+    of the closest projection.
+
+    Returns:
+        (min_distance, distance_along_polyline)
+    """
+    min_dist = float('inf')
+    best_along = 0.0
+    cumulative_len = 0.0
+
+    for i in range(len(polyline_coords) - 1):
+        seg_start = polyline_coords[i]
+        seg_end = polyline_coords[i + 1]
+
+        seg_dx = seg_end[0] - seg_start[0]
+        seg_dy = seg_end[1] - seg_start[1]
+        seg_len = math.sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
+
+        dist, t = point_to_segment_distance(point, seg_start, seg_end)
+
+        if dist < min_dist:
+            min_dist = dist
+            best_along = cumulative_len + t * seg_len
+
+        cumulative_len += seg_len
+
+    return (min_dist, best_along)
+
+
+def project_point_on_polyline(
+    point: Tuple[float, float, float],
+    polyline_coords: List[Tuple[float, float, float]],
+) -> float:
+    """Project point onto polyline, returning distance-along-polyline."""
+    _, distance_along = point_to_polyline_distance(point, polyline_coords)
+    return distance_along
+
+
+def find_contiguous_ranges(indices: List[int]) -> List[Tuple[int, int]]:
+    """
+    Find contiguous index ranges from a list of indices.
+
+    Example: [0,1,2,5,6,10] -> [(0,2), (5,6), (10,10)]
+    """
+    if not indices:
+        return []
+
+    sorted_idx = sorted(set(indices))
+    ranges = []
+    range_start = sorted_idx[0]
+
+    for i in range(1, len(sorted_idx)):
+        if sorted_idx[i] != sorted_idx[i - 1] + 1:
+            ranges.append((range_start, sorted_idx[i - 1]))
+            range_start = sorted_idx[i]
+
+    ranges.append((range_start, sorted_idx[-1]))
+    return ranges
+
+
+def compute_road_bounding_box(
+    road_coords: List[Tuple[float, float, float]],
+    padding: float,
+) -> Tuple[float, float, float, float]:
+    """Compute axis-aligned bounding box with padding. Returns (min_x, min_y, max_x, max_y)."""
+    xs = [c[0] for c in road_coords]
+    ys = [c[1] for c in road_coords]
+    return (min(xs) - padding, min(ys) - padding,
+            max(xs) + padding, max(ys) + padding)
+
+
+def bboxes_overlap(
+    bbox_a: Tuple[float, float, float, float],
+    bbox_b: Tuple[float, float, float, float],
+) -> bool:
+    """Check if two 2D bounding boxes overlap."""
+    return not (bbox_a[2] < bbox_b[0] or bbox_b[2] < bbox_a[0] or
+                bbox_a[3] < bbox_b[1] or bbox_b[3] < bbox_a[1])
+
+
+def _remove_consecutive_duplicates(node_ids: List[int]) -> List[int]:
+    """Remove consecutive duplicate node IDs from a list."""
+    if not node_ids:
+        return node_ids
+    result = [node_ids[0]]
+    for nid in node_ids[1:]:
+        if nid != result[-1]:
+            result.append(nid)
+    return result
+
+
+def _compute_polyline_length(coords: List[Tuple[float, float, float]]) -> float:
+    """Compute total 2D length of a polyline."""
+    length = 0.0
+    for i in range(len(coords) - 1):
+        dx = coords[i + 1][0] - coords[i][0]
+        dy = coords[i + 1][1] - coords[i][1]
+        length += math.sqrt(dx * dx + dy * dy)
+    return length
+
+
+def _compute_overlap_ratio(
+    line_b_coords: List[Tuple[float, float, float]],
+    line_a_coords: List[Tuple[float, float, float]],
+    tolerance: float,
+    sample_step: float = 2.0,
+) -> float:
+    """
+    Compute what fraction of polyline B's length lies within tolerance of polyline A.
+
+    Walks along B in small steps, checking distance to A at each point.
+    Uses Shapely LineString for accurate point-to-polyline distance.
+
+    Args:
+        line_b_coords: Polyline B coordinates [(x,y,z), ...]
+        line_a_coords: Polyline A coordinates [(x,y,z), ...]
+        tolerance: Max distance (m) to be considered "overlapping"
+        sample_step: Distance between sample points along B (m)
+
+    Returns:
+        Fraction [0.0, 1.0] of B's length within tolerance of A
+    """
+    from shapely.geometry import LineString, Point
+
+    # Build Shapely geometries (2D only)
+    line_a = LineString([(c[0], c[1]) for c in line_a_coords])
+    line_b = LineString([(c[0], c[1]) for c in line_b_coords])
+
+    b_length = line_b.length
+    if b_length < 1e-6:
+        return 0.0
+
+    overlap_length = 0.0
+    pos = 0.0
+    while pos <= b_length:
+        point = line_b.interpolate(pos)
+        dist = line_a.distance(point)
+        if dist <= tolerance:
+            overlap_length += min(sample_step, b_length - pos + sample_step)
+        pos += sample_step
+
+    return min(1.0, overlap_length / b_length)
+
+
+def merge_overlapping_roads(
+    nodes: List[Dict],
+    roads: List[Dict],
+    merge_tolerance: float = 15.0,
+    min_overlap_nodes: int = 3,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Remove duplicate roads that represent the same physical road.
+
+    Algorithm: Road Absorption
+    ============================================================
+    When multiple machines travel the same physical road, separate road
+    polylines are created (5-20m lateral GPS offset). Instead of merging
+    at the node level (which causes fragmentation and index issues), this
+    function REMOVES duplicate roads entirely.
+
+    Steps:
+      1. BUILD: Create Shapely polylines for each road, compute lengths
+      2. FILTER: Bounding box pre-filter for candidate pairs
+      3. MEASURE: For each candidate pair, compute directed overlap ratio
+         (fraction of shorter road's length within tolerance of longer road)
+      4. GROUP: Build similarity graph, find connected components
+         (roads in the same group represent the same physical road)
+      5. SELECT: For each group, keep the longest road, mark others for removal
+      6. CLEAN: Remove marked roads and unused nodes
+
+    This approach avoids all node-level issues:
+      - No node interleaving → no topology corruption
+      - No section replacement → no index shift bugs
+      - No shared nodes → no split fragmentation
+      - Works correctly with curved roads (no direction check needed)
+
+    Args:
+        nodes: List of node dicts from create_roads_from_trajectories()
+        roads: List of road dicts from create_roads_from_trajectories()
+        merge_tolerance: Max distance (m) to consider roads overlapping
+        min_overlap_nodes: Not used (kept for API compatibility)
+
+    Returns:
+        (updated_nodes, updated_roads) with duplicate roads removed
+    """
+    if not roads or len(roads) < 2:
+        return nodes, roads
+
+    print(f"    Merging overlapping roads (tolerance={merge_tolerance}m)...")
+
+    # Step 1: Build node coord lookup and road polylines
+    node_coords: Dict[int, Tuple[float, float, float]] = {}
+    for node in nodes:
+        node_coords[node["id"]] = tuple(node["coords"])
+
+    road_data: Dict[int, Dict] = {}  # rid -> {coords, length, bbox}
+    for road in roads:
+        rid = road["id"]
+        coords = [node_coords[nid] for nid in road["nodes"] if nid in node_coords]
+        if len(coords) >= 2:
+            length = _compute_polyline_length(coords)
+            road_data[rid] = {
+                "coords": coords,
+                "length": length,
+                "bbox": compute_road_bounding_box(coords, merge_tolerance),
+            }
+
+    # Step 2: Bounding box pre-filter for candidate pairs
+    road_ids = list(road_data.keys())
+    candidate_pairs = []
+    for i in range(len(road_ids)):
+        for j in range(i + 1, len(road_ids)):
+            rid_a, rid_b = road_ids[i], road_ids[j]
+            if bboxes_overlap(road_data[rid_a]["bbox"], road_data[rid_b]["bbox"]):
+                candidate_pairs.append((rid_a, rid_b))
+
+    if not candidate_pairs:
+        print(f"      No candidate pairs found")
+        return nodes, roads
+
+    print(f"      {len(candidate_pairs)} candidate pairs (bbox filter)")
+
+    # Step 3: Compute overlap ratios for each pair
+    # An edge (A, B) means B is absorbed by A (B's overlap ratio >= threshold)
+    OVERLAP_THRESHOLD = 0.7  # At least 70% of shorter road must be covered
+    overlap_edges: List[Tuple[int, int]] = []  # (longer_rid, shorter_rid)
+
+    for rid_a, rid_b in candidate_pairs:
+        data_a = road_data[rid_a]
+        data_b = road_data[rid_b]
+
+        # Determine which is longer
+        if data_a["length"] >= data_b["length"]:
+            longer_rid, shorter_rid = rid_a, rid_b
+            longer_coords, shorter_coords = data_a["coords"], data_b["coords"]
+        else:
+            longer_rid, shorter_rid = rid_b, rid_a
+            longer_coords, shorter_coords = data_b["coords"], data_a["coords"]
+
+        # Compute overlap: what fraction of shorter road is within tolerance of longer
+        overlap_ratio = _compute_overlap_ratio(
+            shorter_coords, longer_coords, merge_tolerance
+        )
+
+        if overlap_ratio >= OVERLAP_THRESHOLD:
+            overlap_edges.append((longer_rid, shorter_rid))
+
+    if not overlap_edges:
+        print(f"      No roads to merge (threshold={OVERLAP_THRESHOLD:.0%})")
+        return nodes, roads
+
+    print(f"      {len(overlap_edges)} overlap edges found")
+
+    # Step 4: Group roads using Union-Find
+    parent: Dict[int, int] = {}
+
+    def find(x: int) -> int:
+        if x not in parent:
+            parent[x] = x
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # Path compression
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for longer_rid, shorter_rid in overlap_edges:
+        union(longer_rid, shorter_rid)
+
+    # Build groups: root -> set of road IDs
+    groups: Dict[int, Set[int]] = {}
+    all_grouped_rids = set()
+    for longer_rid, shorter_rid in overlap_edges:
+        all_grouped_rids.add(longer_rid)
+        all_grouped_rids.add(shorter_rid)
+
+    for rid in all_grouped_rids:
+        root = find(rid)
+        if root not in groups:
+            groups[root] = set()
+        groups[root].add(rid)
+
+    # Step 5: For each group, keep longest road, mark others for removal
+    roads_to_remove: Set[int] = set()
+
+    for root, group_rids in groups.items():
+        if len(group_rids) <= 1:
+            continue
+
+        # Find the longest road in the group
+        primary_rid = max(group_rids, key=lambda rid: road_data[rid]["length"])
+
+        # Mark all others for removal
+        for rid in group_rids:
+            if rid != primary_rid:
+                roads_to_remove.add(rid)
+
+    if not roads_to_remove:
+        print(f"      No duplicate roads to remove")
+        return nodes, roads
+
+    # Step 6: Remove marked roads and clean up unused nodes
+    original_road_count = len(roads)
+    roads = [r for r in roads if r["id"] not in roads_to_remove]
+
+    used_ids: Set[int] = set()
+    for road in roads:
+        used_ids.update(road["nodes"])
+
+    original_node_count = len(nodes)
+    nodes = [n for n in nodes if n["id"] in used_ids]
+    removed_nodes = original_node_count - len(nodes)
+
+    print(f"      Removed {len(roads_to_remove)} duplicate roads "
+          f"({original_road_count} -> {len(roads)})")
+    if removed_nodes > 0:
+        print(f"      Removed {removed_nodes} unused nodes")
+
+    return nodes, roads
 
 
 def create_roads_from_trajectories(
@@ -1495,7 +1860,7 @@ def detect_zones(
             "outnode_ids": [nearest["node_id"]],
         }
         
-        if avg_payload < 30:  # Load zone
+        if avg_payload <= 50:  # Load zone
             zone = {
                 "id": load_id,
                 "name": f"Load zone {load_id}",
@@ -1507,7 +1872,7 @@ def detect_zones(
             }
             load_zones.append(zone)
             load_id += 1
-        elif avg_payload > 70:  # Dump zone
+        elif avg_payload > 50:  # Dump zone
             zone = {
                 "id": dump_id,
                 "name": f"Dump zone {dump_id}",
@@ -4383,6 +4748,7 @@ def process_site(
     min_density: int = 3,
     simplify_epsilon: float = 5.0,
     max_node_distance: float = 500.0,
+    merge_tolerance: float = 15.0,
     zone_grid_size: float = 10.0,
     zone_min_stops: int = 20,
     sim_time: int = 480,
@@ -4504,6 +4870,11 @@ def process_site(
         print("  Error: Could not generate road network")
         return {}
 
+    # Merge geometrically overlapping roads before splitting
+    nodes, roads = merge_overlapping_roads(
+        nodes, roads, merge_tolerance=merge_tolerance
+    )
+
     # Split roads at intersections and overlaps
     # This ensures roads only share nodes at endpoints
     roads, road_composition = split_roads_at_intersections(roads)
@@ -4516,12 +4887,63 @@ def process_site(
         load_zones, dump_zones = convert_reader_zones_to_model(
             precomputed_zones, nodes, roads
         )
+        print(f"    Reader.py: {len(load_zones)} load zones, {len(dump_zones)} dump zones")
+
+        # Supplement with detect_zones() to catch zones Reader.py missed
+        if telemetry_data:
+            print("    Running supplementary grid-based zone detection...")
+            sup_load, sup_dump = detect_zones(
+                telemetry_data, nodes, roads, zone_grid_size, zone_min_stops,
+                coordinates_in_meters=coordinates_in_meters
+            )
+            # Merge non-duplicate zones (skip if within 100m of existing zone)
+            merge_dist = 100.0
+            for sz in sup_load:
+                sl = sz.get("detected_location", {})
+                sx, sy = sl.get("x", 0), sl.get("y", 0)
+                is_dup = False
+                for ez in load_zones:
+                    el = ez.get("detected_location", {})
+                    dx = sx - el.get("x", 0)
+                    dy = sy - el.get("y", 0)
+                    if math.sqrt(dx * dx + dy * dy) < merge_dist:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    sz["id"] = len(load_zones) + 1
+                    sz["name"] = f"Load zone {sz['id']}"
+                    load_zones.append(sz)
+
+            for sz in sup_dump:
+                sl = sz.get("detected_location", {})
+                sx, sy = sl.get("x", 0), sl.get("y", 0)
+                is_dup = False
+                for ez in dump_zones:
+                    el = ez.get("detected_location", {})
+                    dx = sx - el.get("x", 0)
+                    dy = sy - el.get("y", 0)
+                    if math.sqrt(dx * dx + dy * dy) < merge_dist:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    sz["id"] = len(dump_zones) + 1
+                    sz["name"] = f"Dump zone {sz['id']}"
+                    dump_zones.append(sz)
+
+            added_load = len(load_zones) - len([z for z in load_zones if not any(
+                s.get("detected_location") == z.get("detected_location") for s in sup_load
+            )])
+            added_dump = len(dump_zones) - len([z for z in dump_zones if not any(
+                s.get("detected_location") == z.get("detected_location") for s in sup_dump
+            )])
+            if sup_load or sup_dump:
+                print(f"    Supplementary: found {len(sup_load)} load, {len(sup_dump)} dump candidates")
     else:
         load_zones, dump_zones = detect_zones(
             telemetry_data, nodes, roads, zone_grid_size, zone_min_stops,
             coordinates_in_meters=coordinates_in_meters
         )
-    print(f"    Found {len(load_zones)} load zones, {len(dump_zones)} dump zones")
+    print(f"    Total: {len(load_zones)} load zones, {len(dump_zones)} dump zones")
 
     # Create model with machine_list from machines_list.json
     model = create_model(
@@ -4779,6 +5201,7 @@ Config file parameters can be overridden by CLI arguments.
     min_density = args.min_density if args.min_density is not None else config["road_detection"]["min_density"]
     simplify_epsilon = config["road_detection"]["simplify_epsilon"]
     max_node_distance = config["road_detection"]["max_node_distance"]
+    merge_tolerance = config["road_detection"].get("merge_tolerance", 15.0)
     zone_grid_size = config["zone_detection"]["grid_size"]
     zone_min_stops = config["zone_detection"]["min_stop_count"]
     sim_time = args.sim_time if args.sim_time is not None else config["simulation"]["sim_time"]
@@ -4793,6 +5216,7 @@ Config file parameters can be overridden by CLI arguments.
     print(f"    road_detection.min_density: {min_density}")
     print(f"    road_detection.simplify_epsilon: {simplify_epsilon}")
     print(f"    road_detection.max_node_distance: {max_node_distance}")
+    print(f"    road_detection.merge_tolerance: {merge_tolerance}")
     print(f"    zone_detection.grid_size: {zone_grid_size}")
     print(f"    zone_detection.min_stop_count: {zone_min_stops}")
     print(f"    simulation.sim_time: {sim_time}")
@@ -4871,13 +5295,14 @@ Config file parameters can be overridden by CLI arguments.
                 min_density=min_density,
                 simplify_epsilon=simplify_epsilon,
                 max_node_distance=max_node_distance,
+                merge_tolerance=merge_tolerance,
                 zone_grid_size=zone_grid_size,
                 zone_min_stops=zone_min_stops,
                 sim_time=sim_time,
                 machine_templates=machine_templates,
                 machines_list=machines_list,
             )
-            
+
             if result:
                 all_results[site_name] = result
             else:

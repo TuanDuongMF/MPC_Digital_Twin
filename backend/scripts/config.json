@@ -12,7 +12,8 @@
     "grid_size": 5.0,
     "min_density": 3,
     "simplify_epsilon": 5.0,
-    "max_node_distance": 500.0
+    "max_node_distance": 500.0,
+    "merge_tolerance": 15.0
   },
   
   "zone_detection": {

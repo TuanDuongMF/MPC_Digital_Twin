@@ -245,7 +245,7 @@ class AMTCycleProdInfoReader:
             for segment in cycle.segments:
                 if segment.segmentType == SegmentType.TRAVELLING_EMPTY:
                     if segment.preferredPath:
-                        dump_zone_points.extend(
+                        load_zone_points.extend(
                             [
                                 (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                                 for point in segment.preferredPath[-10:]
@@ -254,7 +254,7 @@ class AMTCycleProdInfoReader:
                         )
                 else:
                     if segment.preferredPath:
-                        load_zone_points.extend(
+                        dump_zone_points.extend(
                             [
                                 (point[0], point[1], point[2], cycle.cycleId, cycle.machineId, machine_name)
                                 for point in segment.preferredPath[-10:]

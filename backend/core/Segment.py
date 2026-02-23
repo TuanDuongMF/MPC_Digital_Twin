@@ -237,7 +237,7 @@ class Segment:
         payload_threshold = 50
         if next_payload is not None:
             if self.payload <= payload_threshold:
-                if next_payload > payload_threshold and self.isReversing:
+                if next_payload > payload_threshold:
                     self.segmentType = SegmentType.SPOTTING_AT_SOURCE
                     # uncomment for queing
                     # if self.lossSummary.get('FollowingSiteAwareVehicle'):
@@ -246,7 +246,7 @@ class Segment:
                 else:
                     self.segmentType = SegmentType.TRAVELLING_EMPTY
             else:
-                if next_payload <= payload_threshold and self.isReversing:
+                if next_payload <= payload_threshold:
                     self.segmentType = SegmentType.SPOTTING_AT_SINK
                     # uncomment for queing
                     # if self.lossSummary.get('FollowingSiteAwareVehicle'):
