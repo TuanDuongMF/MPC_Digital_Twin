@@ -33,7 +33,7 @@ backend_dir = os.path.dirname(os.path.abspath(__file__))
 webapp_root = os.path.dirname(backend_dir)
 sys.path.insert(0, webapp_root)
 
-from backend.core.db_config import DB_CONFIG, OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH, TEMP_DIR
+from backend.config import DB_CONFIG, OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH, TEMP_DIR
 from backend.core.gateway_parser_wrapper import parse_gateway_files
 from backend.core.gateway_data_converter import process_parser_output, convert_imported_records_to_telemetry, extract_zones_from_import
 from backend.scripts.simulation_generator import (
@@ -45,6 +45,7 @@ from backend.scripts.simulation_generator import (
     load_machines_list,
     DEFAULT_CONFIG,
 )
+from backend.roads_network_pipeline.run import run_pipeline
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -166,7 +167,7 @@ def process_import_and_export(
     records: List[Dict[str, Any]],
     config: Dict[str, Any],
     output_base_name: str = None,
-    export_model: bool = True,
+    export_model: bool = False,
     export_simulation: bool = True,
     export_routes_excel: bool = False,
 ):
@@ -621,7 +622,7 @@ def import_files():
         
         # Get export configuration from form data (optional)
         config = {}
-        export_model = True
+        export_model = False
         export_simulation = True
         if export_after_import:
             config = {
@@ -634,14 +635,10 @@ def import_files():
                 'zone_min_stops': int(request.form.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])),
                 'sim_time': int(request.form.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])),
             }
-            # Get export file type options
-            export_model = request.form.get('export_model', 'true').lower() == 'true'
+            # Only simulation export is supported for import flow
+            export_model = False
             export_simulation = request.form.get('export_simulation', 'true').lower() == 'true'
-            export_routes_excel = request.form.get('export_routes_excel', 'false').lower() == 'true'
-
-            # At least one type must be selected
-            if not export_model and not export_simulation and not export_routes_excel:
-                return jsonify({"error": "At least one export type must be selected"}), 400
+            export_routes_excel = False
 
         # Validate parser executable
         if not EXECUTE_FILE_PATH or not os.path.exists(EXECUTE_FILE_PATH):
@@ -897,6 +894,90 @@ def download_imported_file(site_name: str, file_type: str):
 def health_check():
     """Health check endpoint."""
     return jsonify({"status": "ok"}), 200
+
+
+@app.route('/api/model/generate-from-db', methods=['POST'])
+def generate_model_from_db():
+    """
+    Generate model data directly from MSSM databases using roads_network_pipeline.
+
+    Request JSON (all optional):
+    - site_id: string, e.g. "3"
+    - site_name: string, e.g. "Desig"
+    - fidelity: "Low" | "High" | ...
+    - output_base: base directory for pipeline io
+    - template_path: path to default templates
+    - skip_extract: bool, if true reuse existing CSVs
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        site_id = data.get('site_id', '1')
+        site_name = data.get('site_name', 'TestSite')
+        fidelity = data.get('fidelity')
+
+        result = run_pipeline(
+            site_id=str(site_id),
+            site_name=str(site_name),
+            fidelity=fidelity,
+        )
+
+        output_path = result.get("output_path")
+        stages = result.get("stages", {})
+        elapsed = result.get("elapsed")
+
+        success = all(stages.values()) if stages else False
+
+        return jsonify({
+            "success": success,
+            "output_path": output_path,
+            "stages": stages,
+            "elapsed_seconds": elapsed,
+        }), 200 if success else 500
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/model/download/<site_id>/<site_name>/<file_type>', methods=['GET'])
+def download_model_file(site_id: str, site_name: str, file_type: str):
+    """
+    Download model-related files generated from MSSM pipeline.
+
+    Files are written under:
+        OUTPUT_PATH/<site_id>_<site_name>/
+
+    Supported file types:
+        - model  -> model.json
+    """
+    try:
+        valid_types = ['model']
+        if file_type not in valid_types:
+            return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
+
+        # Reconstruct pipeline output directory (aligned with run_pipeline)
+        output_base = OUTPUT_PATH
+        if not output_base:
+            return jsonify({"error": "OUTPUT_PATH is not configured on server"}), 500
+
+        dir_name = f"{site_id}_{site_name}"
+        dir_path = resolve_path(os.path.join(output_base, dir_name), "../output")
+
+        filename = "model.json"
+        file_path = os.path.join(dir_path, filename)
+
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File not found on server"}), 404
+
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':

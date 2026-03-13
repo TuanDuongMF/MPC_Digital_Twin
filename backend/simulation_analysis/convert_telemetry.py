@@ -36,7 +36,7 @@ except ImportError:
     def tqdm(iterable, desc=None, total=None, disable=False):
         return iterable
 
-from backend.core.db_config import DB_CONFIG
+from backend.config import DB_CONFIG
 from backend.simulation_analysis import GPSToEventsConverter
 
 

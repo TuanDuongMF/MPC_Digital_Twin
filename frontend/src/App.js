@@ -2,6 +2,7 @@ import React from 'react';
 // import SiteList from './components/SiteList';
 // import ExportButton from './components/ExportButton';
 import ImportButton from './components/ImportButton';
+import GenerateModelFromDbButton from './components/GenerateModelFromDbButton';
 import './App.css';
 
 function App() {
@@ -86,6 +87,11 @@ function App() {
                 </div>
               )}
             </div> */}
+            <GenerateModelFromDbButton
+              onComplete={(data) => {
+                console.log('Model generated from DB:', data);
+              }}
+            />
             <ImportButton
               site={null}
               onImportComplete={(data) => {
