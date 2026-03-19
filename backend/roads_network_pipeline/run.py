@@ -22,11 +22,7 @@ from .tsm import compute_tsm
 from .zones import configure_zones
 
 
-def run_pipeline(
-    site_id="1",
-    site_name="TestSite",
-    fidelity=None,
-):
+def run_pipeline(fidelity=None):
     """Run the full Minestar importer pipeline.
 
     SQL Server credentials and paths are always taken from environment
@@ -54,7 +50,8 @@ def run_pipeline(
     if not EXAMPLE_JSON_PATH:
         raise ValueError("EXAMPLE_JSON_PATH must be configured for roads_network_pipeline.")
 
-    output_path = os.path.join(OUTPUT_PATH, f"{site_id}_{site_name}")
+    # Use OUTPUT_PATH directly (no per-site subdirectory)
+    output_path = OUTPUT_PATH
     template_path = EXAMPLE_JSON_PATH
 
     print("=" * 60)
@@ -62,7 +59,6 @@ def run_pipeline(
     print("=" * 60)
     print(f"  MSSM Server: {mssm_cfg.server}")
     print(f"  MSSM User:   {mssm_cfg.user}")
-    print(f"  Site:        {site_id}_{site_name}")
     print(f"  Fidelity:    {fidelity}")
     print(f"  Output:      {output_path}")
     print(f"  Templates:   {template_path}")

@@ -2,27 +2,27 @@
 Flask RESTful API for AMT Cycle Productivity Message Reader WebApp
 
 Endpoints:
-- GET /api/sites - Get list of available sites
-- POST /api/export - Export model/simulation files for a site
-- POST /api/import - Import and parse raw data files
+- POST /api/simulation/parse - Unified parse pipeline (model + DES inputs + events ledger)
+- GET  /api/simulation/download/<file_type> - Download model, des_inputs, or ledger
+- GET  /api/model/download/<file_type> - Download model.json
+- GET  /api/health - Health check
 """
 
 import io
 import os
 import sys
 import json
+import time
 import threading
 import zipfile
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
-from typing import Dict, List, Any
-from queue import Queue
-from flask import Flask, jsonify, request, send_file, Response
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,17 +33,17 @@ backend_dir = os.path.dirname(os.path.abspath(__file__))
 webapp_root = os.path.dirname(backend_dir)
 sys.path.insert(0, webapp_root)
 
-from backend.config import DB_CONFIG, OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH, TEMP_DIR
+from backend.config import OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH, TEMP_DIR
 from backend.core.gateway_parser_wrapper import parse_gateway_files
 from backend.core.gateway_data_converter import process_parser_output, convert_imported_records_to_telemetry, extract_zones_from_import
 from backend.scripts.simulation_generator import (
     get_connection,
-    fetch_sites,
     fetch_machines,
     process_site,
     load_machine_templates,
     load_machines_list,
     DEFAULT_CONFIG,
+    create_des_inputs_from_model_file,
 )
 from backend.roads_network_pipeline.run import run_pipeline
 
@@ -84,810 +84,306 @@ MACHINES_LIST_PATH = os.path.join(
     "machines_list.json"
 )
 
-# Store export status
-export_status = {}
-
-# Store import status (for import + export flow)
-import_status = {}
-
-# SSE event queues for real-time updates (site_name -> list of queues)
-sse_subscribers: Dict[str, List[Queue]] = {}
+# In-memory job store for /api/simulation/parse progress tracking
+# Note: resets on server restart.
+_parse_jobs = {}
+_parse_jobs_lock = threading.Lock()
 
 
-def get_export_status(site_name: str) -> dict:
-    """Get export status for a site."""
-    return export_status.get(site_name, {
-        "status": "idle",
-        "progress": 0,
-        "message": "",
-        "files": {}
-    })
-
-
-def set_export_status(site_name: str, status: str, progress: int = 0, message: str = "", files: dict = None):
-    """Set export status for a site and notify SSE subscribers."""
-    data = {
-        "status": status,
-        "progress": progress,
-        "message": message,
-        "files": files or {}
-    }
-    export_status[site_name] = data
-    # Notify SSE subscribers
-    _notify_sse(site_name, "export", data)
-
-
-def get_import_status(site_name: str) -> dict:
-    """Get import+export status for a site."""
-    return import_status.get(site_name, {
-        "status": "idle",
-        "progress": 0,
-        "message": "",
-        "files": {}
-    })
-
-
-def set_import_status(site_name: str, status: str, progress: int = 0, message: str = "", files: dict = None):
-    """Set import+export status for a site and notify SSE subscribers."""
-    data = {
-        "status": status,
-        "progress": progress,
-        "message": message,
-        "files": files or {}
-    }
-    import_status[site_name] = data
-    # Notify SSE subscribers
-    _notify_sse(site_name, "import", data)
-
-
-def _notify_sse(site_name: str, event_type: str, data: dict):
-    """Push event to all SSE subscribers for a site."""
-    key = f"{event_type}:{site_name}"
-    print(f"[SSE] Notifying {key}, status={data.get('status')}, subscribers={len(sse_subscribers.get(key, []))}", flush=True)
-    if key in sse_subscribers:
-        event_data = json.dumps(data)
-        dead_queues = []
-        for q in sse_subscribers[key]:
-            try:
-                q.put_nowait(event_data)
-                print(f"[SSE] Event pushed to queue successfully", flush=True)
-            except Exception as e:
-                print(f"[SSE] Failed to push to queue: {e}", flush=True)
-                dead_queues.append(q)
-        # Remove dead queues
-        for q in dead_queues:
-            sse_subscribers[key].remove(q)
-    else:
-        print(f"[SSE] No subscribers for {key}", flush=True)
-
-
-def process_import_and_export(
-    site_name: str,
-    parse_result: Dict[str, Any],
-    records: List[Dict[str, Any]],
-    config: Dict[str, Any],
-    output_base_name: str = None,
-    export_model: bool = False,
-    export_simulation: bool = True,
-    export_routes_excel: bool = False,
-):
-    """Process import and export in background thread."""
-    # Use output_base_name for file naming, fallback to site_name
-    file_base_name = output_base_name if output_base_name else site_name
-
-    try:
-        set_import_status(file_base_name, "processing", 10, "Converting imported data to telemetry format...")
-
-        # Convert imported records to telemetry tuple format
-        sample_interval = config.get('sample_interval', DEFAULT_CONFIG['data_fetching']['sample_interval'])
-        telemetry_data = convert_imported_records_to_telemetry(
-            parse_result,
-            records,
-            sample_interval=sample_interval
-        )
-
-        if not telemetry_data:
-            set_import_status(file_base_name, "error", 0, "Failed to convert imported data")
+def _job_update(job_id: str, **patch):
+    with _parse_jobs_lock:
+        job = _parse_jobs.get(job_id)
+        if not job:
             return
+        job.update(patch)
 
-        set_import_status(file_base_name, "processing", 20, "Extracting zones using Reader.py algorithms...")
 
-        # Extract zones using standard Reader.py algorithms (Segment classification + DBSCAN)
-        cycles, zones = extract_zones_from_import(parse_result)
+def _job_log(job_id: str, message: str):
+    now = time.strftime("%H:%M:%S")
+    line = f"[{now}] {message}"
+    with _parse_jobs_lock:
+        job = _parse_jobs.get(job_id)
+        if not job:
+            return
+        logs = job.setdefault("logs", [])
+        logs.append(line)
+        if len(logs) > 300:
+            del logs[:100]
 
-        set_import_status(file_base_name, "processing", 30, "Preparing machine information...")
 
-        # Create machine info from telemetry data
-        # Note: row[0] is IPAddress in the machines table, not Machine Unique Id
-        machines = {}
-        unique_ip_addresses = set(row[0] for row in telemetry_data)
+def _run_parse_job(job_id: str, fidelity: str, uploaded_zip_path: str, uploaded_zip_name: str):
+    try:
+        _job_update(job_id, status="running", progress=1, stage="init", error=None, files={})
+        _job_log(job_id, f"Job started (fidelity={fidelity}).")
 
-        # Batch query to get TypeName and Machine Unique Id from database by IPAddress
-        machine_types = {}
+        # Step 1: model
+        _job_update(job_id, stage="model", progress=5)
+        _job_log(job_id, "Step 1/3: Generating model.json from MSSM...")
+        pipeline_result = run_pipeline(fidelity=fidelity)
+        output_path = pipeline_result.get("output_path")
+        if not output_path:
+            raise RuntimeError("Pipeline did not return output_path")
+
+        model_path = os.path.join(output_path, "model.json")
+        if not os.path.exists(model_path):
+            raise RuntimeError("model.json not found after pipeline run")
+
+        _job_update(job_id, progress=35)
+        _job_log(job_id, "model.json generated.")
+
+        # Step 2: des inputs
+        _job_update(job_id, stage="des_inputs", progress=40)
+        _job_log(job_id, "Step 2/3: Creating DES inputs from model + machines DB...")
+        connection = get_connection()
+        if not connection:
+            raise RuntimeError("Failed to connect to MySQL database")
         try:
-            connection = get_connection()
-            if connection:
-                cursor = connection.cursor()
-                if unique_ip_addresses:
-                    # Use batch query with IN clause for better performance
-                    placeholders = ','.join(['%s'] * len(unique_ip_addresses))
-                    ip_list = list(unique_ip_addresses)
-                    cursor.execute(
-                        f"SELECT `IPAddress`, `Machine Unique Id`, `TypeName`, `Name` FROM machines WHERE `IPAddress` IN ({placeholders})",
-                        ip_list
-                    )
-                    results = cursor.fetchall()
-                    for row in results:
-                        ip_address, machine_unique_id, type_name, name = row
-                        machine_types[ip_address] = {
-                            "machine_unique_id": machine_unique_id,
-                            "type_name": type_name,
-                            "name": name
-                        }
-                        print(f"[Import] IPAddress {ip_address}: Machine Unique Id = {machine_unique_id}, TypeName = {type_name}, Name = {name}", flush=True)
+            cursor = connection.cursor()
+            machines = fetch_machines(cursor)
+        finally:
+            connection.close()
 
-                    # Log IP addresses not found in database
-                    found_ips = set(machine_types.keys())
-                    missing_ips = unique_ip_addresses - found_ips
-                    for ip in missing_ips:
-                        print(f"[Import] IPAddress {ip}: Not found in database", flush=True)
-                connection.close()
-            else:
-                print("[Import] Could not connect to database to fetch machine types", flush=True)
-        except Exception as e:
-            print(f"[Import] Error fetching machine types from database: {e}", flush=True)
+        if not machines:
+            raise RuntimeError("No machines found in database")
 
-        for ip_address in unique_ip_addresses:
-            machine_info = machine_types.get(ip_address, {})
-            machines[ip_address] = {
-                "machine_unique_id": machine_info.get("machine_unique_id", ip_address),
-                "name": machine_info.get("name", f"Machine_{ip_address}"),
-                "site_name": site_name,
-                "type_name": machine_info.get("type_name", "Unknown")
-            }
-            print(f"[Import] Created machine entry: {machines[ip_address]}", flush=True)
-
-        # Load machine templates and machines list
         machine_templates = load_machine_templates(MACHINE_TEMPLATES_PATH)
         machines_list = load_machines_list(MACHINES_LIST_PATH)
-
-        # Process site with imported telemetry data and precomputed zones
-        set_import_status(file_base_name, "processing", 40, "Processing site data and generating simulation files...")
-        print(f"\n[Import] Starting process_site for {file_base_name}...", flush=True)
-        result = process_site(
-            cursor=None,  # No database cursor needed for imported data
-            site_name=site_name,
+        des_inputs = create_des_inputs_from_model_file(
+            model_path=model_path,
             machines=machines,
-            output_dir=OUTPUT_DIR,
-            limit=config.get('limit', DEFAULT_CONFIG['data_fetching']['limit']),
-            sample_interval=sample_interval,
-            grid_size=config.get('grid_size', DEFAULT_CONFIG['road_detection']['grid_size']),
-            min_density=config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density']),
-            simplify_epsilon=config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon']),
-            max_node_distance=config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance']),
-            merge_tolerance=config.get('merge_tolerance', DEFAULT_CONFIG['road_detection']['merge_tolerance']),
-            zone_grid_size=config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size']),
-            zone_min_stops=config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count']),
-            sim_time=config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time']),
-            machine_templates=machine_templates,
-            machines_list=machines_list,
-            telemetry_data=telemetry_data,
-            coordinates_in_meters=True,  # Import data has coordinates in meters
-            precomputed_zones=zones if zones else None,
-            output_base_name=file_base_name,  # Use import filename for output naming
-            export_model=export_model,
-            export_simulation=export_simulation,
-            export_routes_excel=export_routes_excel,
+            site_name="Simulation",
+            sim_time=DEFAULT_CONFIG["simulation"]["sim_time"],
+            machines_with_events=None,
+            machine_templates={"machines_list": machines_list},
+            telemetry_data=None,
+            coordinates_in_meters=True,
         )
 
-        print(f"\n[Import] process_site returned: {result is not None}", flush=True)
-        if result:
-            # Convert absolute paths to relative filenames
-            files = {}
-            for key, path in result.items():
-                if os.path.exists(path):
-                    files[key] = os.path.basename(path)
+        safe_name = "simulation"
+        des_inputs_filename = f"{safe_name}_des_inputs.json.gz"
+        des_inputs_path = os.path.join(output_path, des_inputs_filename)
+        import gzip
 
-            print(f"[Import] Setting status to completed with files: {files}", flush=True)
-            set_import_status(
-                file_base_name,
-                "completed",
-                100,
-                "Import and export completed successfully",
-                files
-            )
-            print(f"[Import] Status set to completed successfully!", flush=True)
-        else:
-            print(f"[Import] process_site returned None or empty result", flush=True)
-            set_import_status(file_base_name, "error", 0, "Failed to generate files")
+        with gzip.open(des_inputs_path, "wb") as f:
+            f.write(json.dumps(des_inputs, indent=2).encode("utf-8"))
 
-    except Exception as e:
-        import traceback
-        print(f"[Import] Exception occurred: {str(e)}", flush=True)
-        traceback.print_exc()
-        set_import_status(file_base_name, "error", 0, f"Error: {str(e)}")
+        _job_update(job_id, progress=60)
+        _job_log(job_id, f"DES inputs written: {des_inputs_filename}")
 
+        # Step 3: ledger
+        _job_update(job_id, stage="ledger", progress=65)
+        _job_log(job_id, "Step 3/3: Parsing raw ZIP and generating events ledger...")
 
-@app.route('/api/sites', methods=['GET'])
-def get_sites():
-    """Get list of available sites."""
-    try:
-        connection = get_connection()
-        if not connection:
-            return jsonify({"error": "Failed to connect to database"}), 500
-        
-        try:
-            cursor = connection.cursor()
-            sites = fetch_sites(cursor)
-            return jsonify({"sites": sites}), 200
-        finally:
-            connection.close()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/export', methods=['POST'])
-def export_files():
-    """Export model/simulation files for a site."""
-    try:
-        data = request.get_json()
-        site_name = data.get('site_name')
-
-        if not site_name:
-            return jsonify({"error": "site_name is required"}), 400
-
-        # Check if export is already in progress
-        status = get_export_status(site_name)
-        if status["status"] == "processing":
-            return jsonify({
-                "error": "Export already in progress",
-                "status": status
-            }), 409
-
-        # Get configuration from request or use defaults
-        config = data.get('config', {})
-        limit = config.get('limit', DEFAULT_CONFIG['data_fetching']['limit'])
-        sample_interval = config.get('sample_interval', DEFAULT_CONFIG['data_fetching']['sample_interval'])
-        grid_size = config.get('grid_size', DEFAULT_CONFIG['road_detection']['grid_size'])
-        min_density = config.get('min_density', DEFAULT_CONFIG['road_detection']['min_density'])
-        simplify_epsilon = config.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon'])
-        max_node_distance = config.get('max_node_distance', DEFAULT_CONFIG['road_detection']['max_node_distance'])
-        merge_tolerance = config.get('merge_tolerance', DEFAULT_CONFIG['road_detection']['merge_tolerance'])
-        zone_grid_size = config.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size'])
-        zone_min_stops = config.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])
-        sim_time = config.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])
-
-        # Get export file type options (default both to True)
-        export_model = data.get('export_model', True)
-        export_simulation = data.get('export_simulation', True)
-        export_routes_excel = data.get('export_routes_excel', False)
-
-        # At least one type must be selected
-        if not export_model and not export_simulation and not export_routes_excel:
-            return jsonify({"error": "At least one export type must be selected"}), 400
-
-        # Start export in background thread
-        thread = threading.Thread(
-            target=process_export,
-            args=(
-                site_name,
-                limit,
-                sample_interval,
-                grid_size,
-                min_density,
-                simplify_epsilon,
-                max_node_distance,
-                merge_tolerance,
-                zone_grid_size,
-                zone_min_stops,
-                sim_time,
-                export_model,
-                export_simulation,
-                export_routes_excel,
-            )
-        )
-        thread.daemon = True
-        thread.start()
-
-        return jsonify({
-            "message": "Export started",
-            "site_name": site_name
-        }), 202
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-def process_export(
-    site_name: str,
-    limit: int,
-    sample_interval: int,
-    grid_size: float,
-    min_density: int,
-    simplify_epsilon: float,
-    max_node_distance: float,
-    merge_tolerance: float,
-    zone_grid_size: float,
-    zone_min_stops: int,
-    sim_time: int,
-    export_model: bool = True,
-    export_simulation: bool = True,
-    export_routes_excel: bool = False,
-):
-    """Process export in background thread."""
-    try:
-        set_export_status(site_name, "processing", 0, "Connecting to database...")
-
-        connection = get_connection()
-        if not connection:
-            set_export_status(site_name, "error", 0, "Failed to connect to database")
-            return
-
-        try:
-            cursor = connection.cursor()
-
-            # Fetch machines
-            set_export_status(site_name, "processing", 10, "Fetching machine information...")
-            machines = fetch_machines(cursor, site_name)
-
-            if not machines:
-                set_export_status(site_name, "error", 0, f"No machines found for site: {site_name}")
-                return
-
-            # Load machine templates and machines list
-            machine_templates = load_machine_templates(MACHINE_TEMPLATES_PATH)
-            machines_list = load_machines_list(MACHINES_LIST_PATH)
-
-            # Process site
-            set_export_status(site_name, "processing", 20, "Processing site data...")
-            result = process_site(
-                cursor=cursor,
-                site_name=site_name,
-                machines=machines,
-                output_dir=OUTPUT_DIR,
-                limit=limit,
-                sample_interval=sample_interval,
-                grid_size=grid_size,
-                min_density=min_density,
-                simplify_epsilon=simplify_epsilon,
-                max_node_distance=max_node_distance,
-                merge_tolerance=merge_tolerance,
-                zone_grid_size=zone_grid_size,
-                zone_min_stops=zone_min_stops,
-                sim_time=sim_time,
-                machine_templates=machine_templates,
-                machines_list=machines_list,
-                export_model=export_model,
-                export_simulation=export_simulation,
-                export_routes_excel=export_routes_excel,
-            )
-
-            if result:
-                # Convert absolute paths to relative filenames
-                files = {}
-                for key, path in result.items():
-                    if os.path.exists(path):
-                        files[key] = os.path.basename(path)
-
-                set_export_status(
-                    site_name,
-                    "completed",
-                    100,
-                    "Export completed successfully",
-                    files
-                )
-            else:
-                set_export_status(site_name, "error", 0, "Failed to generate files")
-
-        finally:
-            connection.close()
-
-    except Exception as e:
-        set_export_status(site_name, "error", 0, f"Error: {str(e)}")
-
-
-@app.route('/api/export/status/<site_name>', methods=['GET'])
-def get_export_status_endpoint(site_name: str):
-    """Get export status for a site."""
-    status = get_export_status(site_name)
-    return jsonify(status), 200
-
-
-@app.route('/api/export/events/<site_name>', methods=['GET'])
-def export_events_sse(site_name: str):
-    """SSE endpoint for real-time export status updates."""
-    def event_stream():
-        q = Queue()
-        key = f"export:{site_name}"
-        if key not in sse_subscribers:
-            sse_subscribers[key] = []
-        sse_subscribers[key].append(q)
-
-        # Send current status immediately
-        current = get_export_status(site_name)
-        yield f"data: {json.dumps(current)}\n\n"
-
-        # If already completed or error, no need to wait for more events
-        if current.get("status") in ("completed", "error"):
-            if key in sse_subscribers and q in sse_subscribers[key]:
-                sse_subscribers[key].remove(q)
-            return
-
-        try:
-            while True:
-                # Timeout 600s (10 minutes) for long-running exports
-                data = q.get(timeout=600)
-                yield f"data: {data}\n\n"
-                # Stop if completed or error
-                parsed = json.loads(data)
-                if parsed.get("status") in ("completed", "error"):
-                    break
-        except Exception:
-            pass
-        finally:
-            if key in sse_subscribers and q in sse_subscribers[key]:
-                sse_subscribers[key].remove(q)
-
-    return Response(event_stream(), mimetype='text/event-stream')
-
-
-@app.route('/api/export/download/<site_name>/<file_type>', methods=['GET'])
-def download_file(site_name: str, file_type: str):
-    """Download exported file."""
-    try:
-        # Validate file type
-        valid_types = ['model', 'des_inputs', 'ledger', 'routes_excel']
-        if file_type not in valid_types:
-            return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
-        
-        # Get status to find filename
-        status = get_export_status(site_name)
-        if status["status"] != "completed":
-            return jsonify({"error": "Export not completed"}), 400
-        
-        filename = status["files"].get(file_type)
-        if not filename:
-            return jsonify({"error": f"File {file_type} not found"}), 404
-        
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        if not os.path.exists(file_path):
-            return jsonify({"error": "File not found on server"}), 404
-
-        # Read file into memory, delete from disk, then send
-        with open(file_path, 'rb') as f:
-            file_data = io.BytesIO(f.read())
-
-        # Delete file after reading to optimize disk space
-        try:
-            os.remove(file_path)
-            print(f"[Cleanup] Deleted file after reading: {filename}", flush=True)
-        except Exception as e:
-            print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
-
-        # Determine mimetype based on file extension
-        if filename.endswith('.gz'):
-            mimetype = 'application/gzip'
-        elif filename.endswith('.xlsx'):
-            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        else:
-            mimetype = 'application/json'
-        return send_file(
-            file_data,
-            as_attachment=True,
-            download_name=filename,
-            mimetype=mimetype
-        )
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/import', methods=['POST'])
-def import_files():
-    """
-    Import and parse raw data files.
-
-    Accepts:
-    - Single ZIP file containing raw data files
-
-    Query parameters:
-    - export: If "true", will also export simulation files after import
-
-    Returns parsed JSON data, or starts export process if export=true.
-    """
-    try:
-        # Check if files are in request
-        if 'files' not in request.files:
-            return jsonify({"error": "No files provided"}), 400
-        
-        files = request.files.getlist('files')
-        if not files or files[0].filename == '':
-            return jsonify({"error": "No files selected"}), 400
-
-        # Validate: only accept single .zip file
-        if len(files) != 1:
-            return jsonify({"error": "Please upload exactly one ZIP file"}), 400
-        if not files[0].filename.lower().endswith('.zip'):
-            return jsonify({"error": "Only ZIP files are allowed"}), 400
-
-        # Get site_name from form data (optional, default to "DefaultSite")
-        site_name = request.form.get('site_name', 'DefaultSite')
-
-        # Get output_base_name from form data (used for output file naming)
-        # This allows naming output files based on input filename (e.g., ABC.zip -> ABC_model.json)
-        output_base_name = request.form.get('output_base_name', None)
-
-        # Check if export is requested
-        export_after_import = request.form.get('export', 'false').lower() == 'true'
-        
-        # Get export configuration from form data (optional)
-        config = {}
-        export_model = False
-        export_simulation = True
-        if export_after_import:
-            config = {
-                'limit': int(request.form.get('limit', DEFAULT_CONFIG['data_fetching']['limit'])),
-                'sample_interval': int(request.form.get('sample_interval', DEFAULT_CONFIG['data_fetching']['sample_interval'])),
-                'grid_size': float(request.form.get('grid_size', DEFAULT_CONFIG['road_detection']['grid_size'])),
-                'min_density': int(request.form.get('min_density', DEFAULT_CONFIG['road_detection']['min_density'])),
-                'simplify_epsilon': float(request.form.get('simplify_epsilon', DEFAULT_CONFIG['road_detection']['simplify_epsilon'])),
-                'zone_grid_size': float(request.form.get('zone_grid_size', DEFAULT_CONFIG['zone_detection']['grid_size'])),
-                'zone_min_stops': int(request.form.get('zone_min_stops', DEFAULT_CONFIG['zone_detection']['min_stop_count'])),
-                'sim_time': int(request.form.get('sim_time', DEFAULT_CONFIG['simulation']['sim_time'])),
-            }
-            # Only simulation export is supported for import flow
-            export_model = False
-            export_simulation = request.form.get('export_simulation', 'true').lower() == 'true'
-            export_routes_excel = False
-
-        # Validate parser executable
         if not EXECUTE_FILE_PATH or not os.path.exists(EXECUTE_FILE_PATH):
-            return jsonify({
-                "error": "Parser executable not found. Please configure EXECUTE_FILE_PATH in .env"
-            }), 500
-        
-        # Create temporary directory for uploaded files
-        # Use TEMP_DIR from env or system temp to avoid Windows MAX_PATH (260) limit
+            raise RuntimeError("Parser executable not found. Please configure EXECUTE_FILE_PATH in .env")
+
         temp_base = TEMP_DIR if TEMP_DIR else None
         if temp_base and not os.path.exists(temp_base):
             os.makedirs(temp_base, exist_ok=True)
-        temp_upload_dir = tempfile.mkdtemp(prefix='imp_', dir=temp_base)
-        file_paths = []
-        
+        temp_upload_dir = tempfile.mkdtemp(prefix="parse_", dir=temp_base)
+
+        ledger_filename = None
         try:
-            # Process uploaded files
-            for file in files:
-                if file.filename == '':
-                    continue
-                
-                filename = secure_filename(file.filename)
-                file_path = os.path.join(temp_upload_dir, filename)
-                
-                # Save file in chunks for large files
-                with open(file_path, 'wb') as f:
-                    # Read in chunks of 64MB
-                    chunk_size = 64 * 1024 * 1024
-                    while True:
-                        chunk = file.stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                
-                # Check if it's a zip file
-                if filename.lower().endswith('.zip'):
-                    # Extract zip file - use short directory name to avoid Windows MAX_PATH (260) limit
-                    extract_dir = os.path.join(temp_upload_dir, f"e{len(file_paths)}")
-                    os.makedirs(extract_dir, exist_ok=True)
+            if not uploaded_zip_name.lower().endswith(".zip"):
+                raise ValueError("Only ZIP files are allowed")
 
-                    try:
-                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                            # Count valid files for progress bar
-                            valid_files = [
-                                zi for zi in zip_ref.infolist()
-                                if not zi.is_dir() and not zi.filename.lower().endswith('.zip')
-                            ]
-                            total_files = len(valid_files)
-                            print(f"\n[ZIP] Extracting {total_files} files from {filename}")
+            zip_name = secure_filename(uploaded_zip_name) or "raw.zip"
+            zip_path = os.path.join(temp_upload_dir, zip_name)
+            _job_log(job_id, f"Staging ZIP: {zip_name}")
+            shutil.copy2(uploaded_zip_path, zip_path)
 
-                            # Extract files one by one with short names to avoid MAX_PATH limit
-                            file_idx = 0
-                            for zip_info in tqdm(valid_files, desc="Extracting", unit="file"):
-                                # Get original extension
-                                orig_name = os.path.basename(zip_info.filename)
-                                _, ext = os.path.splitext(orig_name)
+            extract_dir = os.path.join(temp_upload_dir, "e0")
+            os.makedirs(extract_dir, exist_ok=True)
+            file_paths = []
 
-                                # Create short filename: f0.dat, f1.dat, etc.
-                                short_name = f"f{file_idx}{ext}"
-                                target_path = os.path.join(extract_dir, short_name)
+            _job_log(job_id, "Extracting ZIP...")
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                valid_files = [
+                    zi
+                    for zi in zip_ref.infolist()
+                    if not zi.is_dir() and not zi.filename.lower().endswith(".zip")
+                ]
 
-                                # Extract file content and write to short path
-                                with zip_ref.open(zip_info) as src, open(target_path, 'wb') as dst:
-                                    shutil.copyfileobj(src, dst)
+                for idx, zip_info in enumerate(valid_files):
+                    orig_name = os.path.basename(zip_info.filename)
+                    _, ext = os.path.splitext(orig_name)
+                    short_name = f"f{idx}{ext}"
+                    target_path = os.path.join(extract_dir, short_name)
+                    with zip_ref.open(zip_info) as src, open(target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    file_paths.append(target_path)
 
-                                file_paths.append(target_path)
-                                file_idx += 1
-                    except zipfile.BadZipFile:
-                        return jsonify({"error": f"Invalid zip file: {filename}"}), 400
-                else:
-                    file_paths.append(file_path)
-            
             if not file_paths:
-                return jsonify({"error": "No valid files found"}), 400
-            
-            # Parse files using gateway parser
-            # Pass temp_base to avoid Windows MAX_PATH (260) limit
+                raise ValueError("No valid files found in ZIP")
+
+            _job_update(job_id, progress=75)
+            _job_log(job_id, f"Running gateway parser on {len(file_paths)} files...")
             parse_result = parse_gateway_files(
-                site_name=site_name,
+                site_name="Simulation",
                 file_paths=file_paths,
                 parser_exe_path=EXECUTE_FILE_PATH,
-                temp_base_dir=temp_base
+                temp_base_dir=temp_base,
             )
-            
-            # Check if parsing was successful
+
             if "error" in parse_result:
-                return jsonify({
-                    "success": False,
-                    "error": parse_result.get("error"),
-                    "details": parse_result.get("details", [])
-                }), 400
-            
-            # Process parser output using same logic as parse_gateway_messages.py
-            # Returns list of dicts with database column names
+                raise RuntimeError(parse_result.get("error") or "Gateway parser failed")
+
+            _job_update(job_id, progress=82)
+            _job_log(job_id, "Converting parser output to telemetry...")
             records = process_parser_output(parse_result)
-            
-            if export_after_import:
-                # Use output_base_name for SSE key and file naming
-                sse_key = output_base_name if output_base_name else site_name
+            sample_interval = DEFAULT_CONFIG["data_fetching"]["sample_interval"]
+            telemetry_data = convert_imported_records_to_telemetry(
+                parse_result,
+                records,
+                sample_interval=sample_interval,
+            )
 
-                # Start export in background thread
-                thread = threading.Thread(
-                    target=process_import_and_export,
-                    args=(
-                        site_name,
-                        parse_result,
-                        records,
-                        config,
-                        output_base_name,  # Pass output_base_name for file naming
-                        export_model,
-                        export_simulation,
-                        export_routes_excel,
-                    )
-                )
-                thread.daemon = True
-                thread.start()
+            _job_log(job_id, "Extracting zones from import...")
+            _, zones = extract_zones_from_import(parse_result)
 
-                return jsonify({
-                    "success": True,
-                    "message": "Import completed, export started",
-                    "site_name": site_name,
-                    "output_base_name": sse_key,  # Return the key for SSE subscription
-                    "files_processed": len(file_paths),
-                    "records_count": len(records),
-                    "export_status": "processing"
-                }), 202
-            
-            # Prepare response matching parse_gateway_messages.py output format
-            response_data = {
-                "success": True,
-                "site_name": site_name,
-                "files_processed": len(file_paths),
-                "records_count": len(records),
-                "records": records
-            }
-            
-            return jsonify(response_data), 200
-            
+            _job_update(job_id, progress=90)
+            _job_log(job_id, "Generating ledger via process_site()...")
+            result = process_site(
+                cursor=None,
+                site_name="Simulation",
+                machines=machines,
+                output_dir=output_path,
+                limit=DEFAULT_CONFIG["data_fetching"]["limit"],
+                sample_interval=sample_interval,
+                grid_size=DEFAULT_CONFIG["road_detection"]["grid_size"],
+                min_density=DEFAULT_CONFIG["road_detection"]["min_density"],
+                simplify_epsilon=DEFAULT_CONFIG["road_detection"]["simplify_epsilon"],
+                max_node_distance=DEFAULT_CONFIG["road_detection"]["max_node_distance"],
+                merge_tolerance=DEFAULT_CONFIG["road_detection"]["merge_tolerance"],
+                zone_grid_size=DEFAULT_CONFIG["zone_detection"]["grid_size"],
+                zone_min_stops=DEFAULT_CONFIG["zone_detection"]["min_stop_count"],
+                sim_time=DEFAULT_CONFIG["simulation"]["sim_time"],
+                machine_templates=machine_templates,
+                machines_list=machines_list,
+                telemetry_data=telemetry_data,
+                coordinates_in_meters=True,
+                precomputed_zones=zones if zones else None,
+                output_base_name=safe_name,
+                export_model=False,
+                export_simulation=True,
+                export_routes_excel=False,
+            )
+
+            if result and "ledger" in result and os.path.exists(result["ledger"]):
+                ledger_filename = os.path.basename(result["ledger"])
+                _job_log(job_id, f"Ledger written: {ledger_filename}")
+            else:
+                _job_log(job_id, "Ledger not produced by process_site().")
+
         finally:
-            # Cleanup temporary directory
             try:
                 shutil.rmtree(temp_upload_dir, ignore_errors=True)
             except Exception:
                 pass
-                
+            try:
+                if uploaded_zip_path and os.path.exists(uploaded_zip_path):
+                    os.remove(uploaded_zip_path)
+            except Exception:
+                pass
+            try:
+                staged_parent = os.path.dirname(uploaded_zip_path) if uploaded_zip_path else None
+                if staged_parent and os.path.isdir(staged_parent):
+                    shutil.rmtree(staged_parent, ignore_errors=True)
+            except Exception:
+                pass
+
+        stages = pipeline_result.get("stages", {})
+        elapsed = pipeline_result.get("elapsed")
+        files = {
+            "model": "model.json",
+            "des_inputs": des_inputs_filename,
+            "ledger": ledger_filename,
+        }
+
+        _job_update(
+            job_id,
+            status="completed",
+            stage="done",
+            progress=100,
+            output_path=output_path,
+            stages=stages,
+            elapsed_seconds=elapsed,
+            files=files,
+        )
+        _job_log(job_id, "Job completed.")
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        _job_update(job_id, status="error", stage="error", progress=100, error=str(e))
+        _job_log(job_id, f"ERROR: {e}")
 
 
-@app.route('/api/import/status/<site_name>', methods=['GET'])
-def get_import_status_endpoint(site_name: str):
-    """Get import+export status for a site."""
-    status = get_import_status(site_name)
-    return jsonify(status), 200
 
-
-@app.route('/api/import/events/<site_name>', methods=['GET'])
-def import_events_sse(site_name: str):
-    """SSE endpoint for real-time import status updates."""
-    def event_stream():
-        q = Queue()
-        key = f"import:{site_name}"
-        if key not in sse_subscribers:
-            sse_subscribers[key] = []
-        sse_subscribers[key].append(q)
-
-        # Send current status immediately
-        current = get_import_status(site_name)
-        yield f"data: {json.dumps(current)}\n\n"
-
-        # If already completed or error, no need to wait for more events
-        if current.get("status") in ("completed", "error"):
-            if key in sse_subscribers and q in sse_subscribers[key]:
-                sse_subscribers[key].remove(q)
-            return
-
-        try:
-            while True:
-                # Timeout 600s (10 minutes) for long-running imports
-                data = q.get(timeout=600)
-                yield f"data: {data}\n\n"
-                # Stop if completed or error
-                parsed = json.loads(data)
-                if parsed.get("status") in ("completed", "error"):
-                    break
-        except Exception:
-            pass
-        finally:
-            if key in sse_subscribers and q in sse_subscribers[key]:
-                sse_subscribers[key].remove(q)
-
-    return Response(event_stream(), mimetype='text/event-stream')
-
-
-@app.route('/api/import/download/<site_name>/<file_type>', methods=['GET'])
-def download_imported_file(site_name: str, file_type: str):
+@app.route('/api/simulation/parse', methods=['POST'])
+def parse_simulation():
     """
-    Download exported file from import.
+    Unified simulation parsing pipeline:
+    1. Generate model.json from MSSM databases (roads_network_pipeline).
+    2. Generate DES inputs from the generated model and machines from DB.
+    3. Generate events ledger from raw telemetry.
 
-    Args:
-        site_name: The output_base_name used during import (e.g., "ABC" for ABC.zip)
-        file_type: One of 'model', 'des_inputs', 'ledger', 'routes_excel'
+    Request: multipart/form-data with fields:
+      - fidelity: string (optional, default "Low")
+      - file: ZIP with raw gateway data (REQUIRED).
     """
     try:
-        # Validate file type
-        valid_types = ['model', 'des_inputs', 'ledger', 'routes_excel']
-        if file_type not in valid_types:
-            return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
-        
-        # Get status to find filename
-        status = get_import_status(site_name)
-        if status["status"] != "completed":
-            return jsonify({"error": "Import/export not completed"}), 400
-        
-        filename = status["files"].get(file_type)
-        if not filename:
-            return jsonify({"error": f"File {file_type} not found"}), 404
-        
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        if not os.path.exists(file_path):
-            return jsonify({"error": "File not found on server"}), 404
+        if "file" not in request.files or request.files["file"].filename == "":
+            return jsonify({"error": "Raw ZIP file is required"}), 400
 
-        # Read file into memory, delete from disk, then send
-        with open(file_path, 'rb') as f:
-            file_data = io.BytesIO(f.read())
+        fidelity = request.form.get("fidelity", "Low")
 
-        # Delete file after reading to optimize disk space
-        try:
-            os.remove(file_path)
-            print(f"[Cleanup] Deleted file after reading: {filename}", flush=True)
-        except Exception as e:
-            print(f"[Cleanup] Failed to delete file {filename}: {e}", flush=True)
+        upload_file = request.files["file"]
+        if not upload_file.filename or not upload_file.filename.lower().endswith(".zip"):
+            return jsonify({"error": "Only ZIP files are allowed"}), 400
 
-        # Determine mimetype based on file extension
-        if filename.endswith('.gz'):
-            mimetype = 'application/gzip'
-        elif filename.endswith('.xlsx'):
-            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        else:
-            mimetype = 'application/json'
-        return send_file(
-            file_data,
-            as_attachment=True,
-            download_name=filename,
-            mimetype=mimetype
+        job_id = uuid.uuid4().hex
+        temp_base = TEMP_DIR if TEMP_DIR else None
+        if temp_base and not os.path.exists(temp_base):
+            os.makedirs(temp_base, exist_ok=True)
+        staged_dir = tempfile.mkdtemp(prefix="upload_", dir=temp_base)
+        staged_zip_name = secure_filename(upload_file.filename) or "raw.zip"
+        staged_zip_path = os.path.join(staged_dir, staged_zip_name)
+        upload_file.save(staged_zip_path)
+
+        with _parse_jobs_lock:
+            _parse_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "progress": 0,
+                "error": None,
+                "files": {},
+                "logs": [],
+                "created_at": time.time(),
+            }
+        _job_log(job_id, "API received request. Job queued.")
+        _job_log(job_id, f"Staged upload: {staged_zip_name}")
+
+        thread = threading.Thread(
+            target=_run_parse_job,
+            args=(job_id, fidelity, staged_zip_path, staged_zip_name),
+            daemon=True,
         )
+        thread.start()
+
+        return jsonify({"success": True, "job_id": job_id}), 202
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/simulation/parse/status/<job_id>', methods=['GET'])
+def parse_simulation_status(job_id: str):
+    with _parse_jobs_lock:
+        job = _parse_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        resp = {k: v for k, v in job.items() if k != "created_at"}
+    return jsonify(resp), 200
 
 
 @app.route('/api/health', methods=['GET'])
@@ -896,56 +392,12 @@ def health_check():
     return jsonify({"status": "ok"}), 200
 
 
-@app.route('/api/model/generate-from-db', methods=['POST'])
-def generate_model_from_db():
-    """
-    Generate model data directly from MSSM databases using roads_network_pipeline.
-
-    Request JSON (all optional):
-    - site_id: string, e.g. "3"
-    - site_name: string, e.g. "Desig"
-    - fidelity: "Low" | "High" | ...
-    - output_base: base directory for pipeline io
-    - template_path: path to default templates
-    - skip_extract: bool, if true reuse existing CSVs
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-
-        site_id = data.get('site_id', '1')
-        site_name = data.get('site_name', 'TestSite')
-        fidelity = data.get('fidelity')
-
-        result = run_pipeline(
-            site_id=str(site_id),
-            site_name=str(site_name),
-            fidelity=fidelity,
-        )
-
-        output_path = result.get("output_path")
-        stages = result.get("stages", {})
-        elapsed = result.get("elapsed")
-
-        success = all(stages.values()) if stages else False
-
-        return jsonify({
-            "success": success,
-            "output_path": output_path,
-            "stages": stages,
-            "elapsed_seconds": elapsed,
-        }), 200 if success else 500
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/model/download/<site_id>/<site_name>/<file_type>', methods=['GET'])
-def download_model_file(site_id: str, site_name: str, file_type: str):
+@app.route('/api/model/download/<file_type>', methods=['GET'])
+def download_model_file(file_type: str):
     """
     Download model-related files generated from MSSM pipeline.
 
-    Files are written under:
-        OUTPUT_PATH/<site_id>_<site_name>/
+    Files are written directly under OUTPUT_PATH (no subdirectories).
 
     Supported file types:
         - model  -> model.json
@@ -955,16 +407,12 @@ def download_model_file(site_id: str, site_name: str, file_type: str):
         if file_type not in valid_types:
             return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
 
-        # Reconstruct pipeline output directory (aligned with run_pipeline)
-        output_base = OUTPUT_PATH
-        if not output_base:
+        # Files are written directly under OUTPUT_PATH (aligned with run_pipeline)
+        if not OUTPUT_PATH:
             return jsonify({"error": "OUTPUT_PATH is not configured on server"}), 500
 
-        dir_name = f"{site_id}_{site_name}"
-        dir_path = resolve_path(os.path.join(output_base, dir_name), "../output")
-
         filename = "model.json"
-        file_path = os.path.join(dir_path, filename)
+        file_path = os.path.join(OUTPUT_PATH, filename)
 
         if not os.path.exists(file_path):
             return jsonify({"error": "File not found on server"}), 404
@@ -974,6 +422,57 @@ def download_model_file(site_id: str, site_name: str, file_type: str):
             as_attachment=True,
             download_name=filename,
             mimetype="application/json",
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/simulation/download/<file_type>', methods=['GET'])
+def download_simulation_file(file_type: str):
+    """
+    Download files generated by /api/simulation/parse.
+
+    Files are written directly under OUTPUT_PATH (no subdirectories).
+
+    Supported file types:
+        - model      -> model.json
+        - des_inputs -> simulation_des_inputs.json.gz
+        - ledger     -> simulation_ledger.json.gz (if available)
+    """
+    try:
+        valid_types = ['model', 'des_inputs', 'ledger']
+        if file_type not in valid_types:
+            return jsonify({"error": f"Invalid file type. Must be one of: {valid_types}"}), 400
+
+        if not OUTPUT_PATH:
+            return jsonify({"error": "OUTPUT_PATH is not configured on server"}), 500
+
+        # Filenames are global under OUTPUT_PATH; route parameters are ignored.
+        safe_name = "simulation"
+
+        if file_type == 'model':
+            filename = "model.json"
+        elif file_type == 'des_inputs':
+            filename = f"{safe_name}_des_inputs.json.gz"
+        else:  # ledger
+            filename = f"{safe_name}_ledger.json.gz"
+
+        file_path = os.path.join(OUTPUT_PATH, filename)
+
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File not found on server"}), 404
+
+        if filename.endswith(".gz"):
+            mimetype = "application/gzip"
+        else:
+            mimetype = "application/json"
+
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype=mimetype,
         )
 
     except Exception as e:

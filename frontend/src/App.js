@@ -1,8 +1,7 @@
 import React from 'react';
 // import SiteList from './components/SiteList';
 // import ExportButton from './components/ExportButton';
-import ImportButton from './components/ImportButton';
-import GenerateModelFromDbButton from './components/GenerateModelFromDbButton';
+import ParseSimulationForm from './components/ParseSimulationForm';
 import './App.css';
 
 function App() {
@@ -65,40 +64,8 @@ function App() {
         )} */}
 
         <div className="row">
-          <div className="col-12 col-md-8 col-lg-6 mx-auto">
-            {/* Temporarily hidden: SiteList and ExportButton */}
-            {/* <div className="col-md-6">
-              <SiteList
-                sites={sites}
-                loading={loading}
-                selectedSite={selectedSite}
-                onSiteSelect={handleSiteSelect}
-              />
-            </div>
-            <div className="col-md-6">
-              {selectedSite && (
-                <div className="mb-4">
-                  <ExportButton
-                    site={selectedSite}
-                    onExportComplete={() => {
-                      // Optionally refresh or show success message
-                    }}
-                  />
-                </div>
-              )}
-            </div> */}
-            <GenerateModelFromDbButton
-              onComplete={(data) => {
-                console.log('Model generated from DB:', data);
-              }}
-            />
-            <ImportButton
-              site={null}
-              onImportComplete={(data) => {
-                // Data is already logged to console
-                console.log('Import completed with data:', data);
-              }}
-            />
+          <div className="col-12">
+            <ParseSimulationForm />
           </div>
         </div>
       </div>

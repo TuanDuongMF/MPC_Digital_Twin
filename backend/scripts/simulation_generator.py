@@ -367,6 +367,16 @@ def merge_dict(base: Dict, overrides: Dict) -> Dict:
 def get_connection():
     """Create database connection."""
     try:
+        ssl_params = None
+        if DB_CONFIG.get("ssl_ca"):
+            ssl_params = {
+                "ca": DB_CONFIG.get("ssl_ca"),
+            }
+            if DB_CONFIG.get("ssl_cert"):
+                ssl_params["cert"] = DB_CONFIG.get("ssl_cert")
+            if DB_CONFIG.get("ssl_key"):
+                ssl_params["key"] = DB_CONFIG.get("ssl_key")
+
         connection = pymysql.connect(
             host=DB_CONFIG["host"],
             port=DB_CONFIG["port"],
@@ -378,6 +388,7 @@ def get_connection():
             connect_timeout=30,
             read_timeout=120,
             write_timeout=120,
+            ssl=ssl_params,
         )
         return connection
     except Exception as e:
@@ -406,18 +417,24 @@ def fetch_sites(cursor) -> List[Dict]:
 
 
 def fetch_machines(cursor, site_name: Optional[str] = None) -> Dict[int, Dict]:
-    """Fetch machine information."""
+    """
+    Fetch machine information.
+
+    If site_name is provided, match either the full site name (m.`Site Name`)
+    or the short name (s.`SiteNameShort`) from the site table.
+    """
     query = """
         SELECT DISTINCT m.`Machine Unique Id`, m.`Machine Id`, m.`Name`, 
                m.`TypeName`, m.`Autonomous`, m.`Site Name`
         FROM machines m
         INNER JOIN amt_cycleprodinfo cp ON m.`Machine Unique Id` = cp.`Machine Unique Id`
+        LEFT JOIN site s ON m.`Site Name` = s.`Site Name`
     """
-    params = []
+    params: List[Any] = []
     if site_name:
-        query += " WHERE m.`Site Name` = %s"
-        params.append(site_name)
-    
+        query += " WHERE (m.`Site Name` = %s OR s.`SiteNameShort` = %s)"
+        params.extend([site_name, site_name])
+
     cursor.execute(query, params)
     machines = {}
     for row in cursor.fetchall():

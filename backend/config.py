@@ -30,6 +30,10 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME", "speed_efficiency"),
     "charset": os.getenv("DB_CHARSET", "utf8mb4"),
     "autocommit": True,
+    # Optional SSL parameters (used when MySQL has require_secure_transport=ON)
+    "ssl_ca": os.getenv("DB_SSL_CA"),       # e.g. /path/to/ca.pem
+    "ssl_cert": os.getenv("DB_SSL_CERT"),   # optional client cert
+    "ssl_key": os.getenv("DB_SSL_KEY"),     # optional client key
 }
 
 

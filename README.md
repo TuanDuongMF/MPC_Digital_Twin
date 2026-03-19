@@ -1,74 +1,58 @@
 # AMT Cycle Productivity Reader WebApp
 
-Simple web application for exporting model and simulation files from AMT telemetry data.
+Web application for generating simulation files from AMT telemetry data. Provides a unified **Parse Data** workflow that produces model, DES inputs, and events ledger from raw gateway files and MSSM databases.
 
 ## Structure
 
 ```
-webapp/
-├── backend/          # Flask RESTful API + All processing logic
-│   ├── app.py        # Main Flask application
-│   ├── requirements.txt
-│   ├── core/         # Core AMT modules
-│   │   ├── Reader.py
-│   │   ├── Cycle.py
-│   │   ├── Segment.py
-│   │   ├── db_config.py
-│   │   └── ... (other core modules)
-│   ├── scripts/      # Scripts for data processing
-│   │   ├── simulation_generator.py
-│   │   └── config.json
-│   └── simulation_analysis/  # Simulation event conversion
-│       ├── gps_to_events_converter.py
-│       └── ... (other simulation modules)
-├── exampleJSON/      # Example data files
-├── frontend/         # React application
-│   ├── public/
-│   ├── src/
-│   │   ├── App.js
-│   │   ├── components/
-│   │   │   ├── SiteList.js
-│   │   │   └── ExportButton.js
-│   │   └── index.js
-│   └── package.json
+Simulation/
+├── backend/
+│   ├── app.py              # Flask API
+│   ├── config.py           # Configuration (env vars)
+│   ├── core/               # Gateway parser, data conversion
+│   ├── roads_network_pipeline/  # MSSM model generation
+│   ├── scripts/            # simulation_generator.py
+│   └── simulation_analysis/
+├── frontend/
+│   └── src/
+│       ├── App.js
+│       └── components/
+│           └── ParseSimulationForm.js
+├── docs/                   # Specifications
 └── README.md
 ```
 
 ## Features
 
-- **List Sites**: Display all available sites from database
-- **Export Files**: Generate and download model/simulation files for selected site
-  - Model file (road network)
-  - DES Inputs file (simulation configuration)
-  - Events Ledger file (simulation events)
-- **Import Raw Data**: Upload and parse raw gateway message files
-  - Support for single files, multiple files, or ZIP archives
-  - Parse gateway messages (`.gwm`, `.dat`, `.bin`, or files without extension)
-  - Returns structured JSON data matching database schema
-  - Handles large files (up to 5 GB) efficiently
+- **Parse Data**: Single workflow that:
+  1. Generates `model.json` from MSSM databases (roads, zones, fleet)
+  2. Creates `simulation_des_inputs.json.gz` from model + MySQL machines
+  3. Produces `simulation_ledger.json.gz` from raw gateway files in uploaded ZIP
+- **Download**: After parsing, download Model, DES Inputs, and Events (Ledger) files
+- **Fidelity**: Select model fidelity (Low/High) for roads_network_pipeline
 
 ## Prerequisites
 
 - Python 3.9+
 - Node.js 16+ and npm
-- MySQL database access (configured in `.env` file)
+- MySQL database (telemetry, machines)
+- MSSM SQL Server access (for model generation)
+- GWMReader.exe parser executable
 
 ## Setup
 
-### Backend Setup
+### Backend
 
-1. Navigate to backend directory:
+1. Navigate to backend:
    ```bash
-   cd webapp/backend
+   cd backend
    ```
 
-2. Create virtual environment (optional but recommended):
+2. Create virtual environment (optional):
    ```bash
    python -m venv venv
-   # Windows
-   venv\Scripts\activate
-   # Linux/Mac
-   source venv/bin/activate
+   # Windows: venv\Scripts\activate
+   # Linux/Mac: source venv/bin/activate
    ```
 
 3. Install dependencies:
@@ -76,189 +60,91 @@ webapp/
    pip install -r requirements.txt
    ```
 
-4. Configure environment variables:
+4. Configure `.env`:
    ```bash
-   # Copy example file
    cp .env.example .env
-   
-   # Edit .env file with your database credentials and paths:
-   # - Database: DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, DB_CHARSET
-   # - OUTPUT_PATH (path to output directory for generated files)
-   # - EXECUTE_FILE_PATH (path to GWMReader.exe parser executable)
-   # - EXAMPLE_JSON_PATH (path to exampleJSON directory)
+   # Edit: DB_*, MSSM_*, OUTPUT_PATH, EXECUTE_FILE_PATH, EXAMPLE_JSON_PATH
    ```
 
-5. Run Flask server:
+5. Run server:
    ```bash
    python app.py
    ```
+   Backend: `http://localhost:5000`
 
-   Backend will run on `http://localhost:5000`
+### Frontend
 
-### Frontend Setup
-
-1. Navigate to frontend directory:
+1. Navigate to frontend:
    ```bash
-   cd webapp/frontend
+   cd frontend
    ```
 
-2. Install dependencies:
+2. Install and start:
    ```bash
    npm install
-   ```
-
-3. Start development server:
-   ```bash
    npm start
    ```
-
-   Frontend will run on `http://localhost:3000` and automatically proxy API requests to backend.
+   Frontend: `http://localhost:3000` (proxies API to backend)
 
 ## Usage
 
-### Export Files
-
-1. Start backend server (port 5000)
-2. Start frontend server (port 3000)
-3. Open browser to `http://localhost:3000`
-4. Select a site from the list
-5. Click "Export Files" to generate model/simulation files
-6. Wait for export to complete (progress bar will show status)
-7. Download generated files using the download buttons
-
-### Import Raw Data
-
-1. Click "Import" button (available regardless of site selection)
-2. Enter site name (or use default)
-3. Select files or ZIP archive containing raw gateway message files
-4. Click "Import" to upload and parse files
-5. View parsed records in the response (list of dictionaries with database column names)
-
-For detailed Import API documentation, see [docs/import_api.md](docs/import_api.md).
+1. Start backend (port 5000) and frontend (port 3000)
+2. Open `http://localhost:3000`
+3. Select **Fidelity** (Low/High)
+4. Upload a **ZIP file** containing raw gateway message files (`.gwm`, `.dat`, `.bin`)
+5. Click **Parse Data**
+6. After completion, use **Download** buttons for Model, DES Inputs, Events (Ledger)
 
 ## API Endpoints
 
-### GET `/api/sites`
-Get list of available sites.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/simulation/parse` | Run 3-step parse pipeline (fidelity + ZIP required) |
+| GET | `/api/simulation/download/<file_type>` | Download model, des_inputs, or ledger |
+| GET | `/api/model/download/<file_type>` | Download model.json |
+| GET | `/api/health` | Health check |
 
-**Response:**
-```json
-{
-  "sites": [
-    {
-      "site_name": "BhpEscondida",
-      "site_short": "ESC",
-      "site_id": 1
-    }
-  ]
-}
-```
-
-### POST `/api/export`
-Start export process for a site.
-
-**Request:**
-```json
-{
-  "site_name": "BhpEscondida",
-  "config": {
-    "limit": 100000,
-    "sample_interval": 5
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "message": "Export started",
-  "site_name": "BhpEscondida"
-}
-```
-
-### GET `/api/export/status/<site_name>`
-Get export status for a site.
-
-**Response:**
-```json
-{
-  "status": "processing",
-  "progress": 50,
-  "message": "Processing site data...",
-  "files": {}
-}
-```
-
-### GET `/api/export/download/<site_name>/<file_type>`
-Download exported file.
-
-**Parameters:**
-- `file_type`: One of `model`, `des_inputs`, `ledger`
-
-### POST `/api/import`
-Import and parse raw gateway message files.
+### POST `/api/simulation/parse`
 
 **Request:** `multipart/form-data`
-- `files`: One or more files (or ZIP archive)
-- `site_name`: Site name (optional, default: "DefaultSite")
+- `fidelity`: string (optional, default `"Low"`)
+- `file`: ZIP with raw gateway data (required)
 
 **Response:**
 ```json
 {
   "success": true,
-  "site_name": "DefaultSite",
-  "files_processed": 34,
-  "records_count": 6072,
-  "records": [
-    {
-      "expectedElapsedTime": 526,
-      "actualElapsedTime": 600,
-      "pathEasting": 9882,
-      ...
-    }
-  ]
+  "output_path": "...",
+  "stages": {...},
+  "elapsed_seconds": 45.2,
+  "files": {
+    "model": "model.json",
+    "des_inputs": "simulation_des_inputs.json.gz",
+    "ledger": "simulation_ledger.json.gz"
+  }
 }
 ```
 
-For detailed documentation, see [docs/import_api.md](docs/import_api.md).
+### GET `/api/simulation/download/<file_type>`
 
-## Development
-
-### Backend
-
-- Flask app with CORS enabled for frontend communication
-- Uses existing `simulation_generator.py` functions for processing
-- Background thread processing for long-running exports
-- Status polling for progress updates
-
-### Frontend
-
-- React 18 with functional components and hooks
-- Bootstrap 5 for styling
-- Real-time status polling during export
-- File download functionality
-
-## Notes
-
-- Export process may take several minutes depending on data size
-- Generated files are saved to directory specified in `OUTPUT_PATH` environment variable
-- Export status is stored in memory (resets on server restart)
-- Frontend polls status every 2 seconds during export
+- `file_type`: `model` | `des_inputs` | `ledger`
+- Returns file as attachment
 
 ## Environment Variables
 
-All configuration is done through `.env` file in `backend/` directory:
+| Variable | Description |
+|----------|-------------|
+| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | MySQL connection |
+| `DB_SSL_CA`, `DB_SSL_CERT`, `DB_SSL_KEY` | Optional MySQL SSL |
+| `MSSM_SERVER`, `MSSM_USER`, `MSSM_PASSWORD`, `MSSM_DATABASE` | MSSM SQL Server |
+| `OUTPUT_PATH` | Output directory for generated files |
+| `EXECUTE_FILE_PATH` | Path to GWMReader.exe |
+| `EXAMPLE_JSON_PATH` | Path to exampleJSON directory |
+| `TEMP_DIR` | Optional temp dir for ZIP extraction |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DB_HOST` | Database host | 192.168.0.18 |
-| `DB_PORT` | Database port | 3306 |
-| `DB_USER` | Database username | dev_user |
-| `DB_PASSWORD` | Database password | (required) |
-| `DB_NAME` | Database name | speed_efficiency |
-| `DB_CHARSET` | Database charset | utf8mb4 |
-| `OUTPUT_PATH` | Output directory for generated files | ../output |
-| `EXECUTE_FILE_PATH` | Path to GWMReader.exe parser executable (required for import) | ../executables |
-| `EXAMPLE_JSON_PATH` | Example JSON files directory | ../exampleJSON |
+## Documentation
 
-All paths can be relative (to backend directory) or absolute.
+- [APP_DESCRIPTION.md](APP_DESCRIPTION.md) — Full application description
+- [docs/des_inputs_specification.md](docs/des_inputs_specification.md) — DES inputs format
+- [docs/event_generation_algorithm.md](docs/event_generation_algorithm.md) — Events generation
+- [docs/model-structure.md](docs/model-structure.md) — Model JSON structure

@@ -54,9 +54,7 @@ function GenerateModelFromDbButton({ onComplete }) {
 
   const handleDownload = async (fileType) => {
     try {
-      const url = `/api/model/download/${encodeURIComponent(siteId)}/${encodeURIComponent(
-        siteName,
-      )}/${fileType}`;
+      const url = `/api/model/download/${fileType}`;
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error('Download failed');
